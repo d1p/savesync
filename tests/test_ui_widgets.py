@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QPushButton
 
-from savesync_bridge.core.config import RCLONE_BACKEND_S3, AppConfig
+from savesync_bridge.core.config import AppConfig
 from savesync_bridge.models.game import Game, GameManifest, Platform, SaveFile, SyncStatus
 from savesync_bridge.ui.conflict_dialog import ConflictDialog
 from savesync_bridge.ui.settings_dialog import SettingsDialog
@@ -20,8 +20,8 @@ from savesync_bridge.ui.widgets.status_badge import StatusBadge
 # Shared fixtures
 # ---------------------------------------------------------------------------
 
-_NOW = datetime(2026, 4, 12, 10, 0, 0, tzinfo=timezone.utc)
-_EARLIER = datetime(2026, 4, 10, 8, 0, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 4, 12, 10, 0, 0, tzinfo=UTC)
+_EARLIER = datetime(2026, 4, 10, 8, 0, 0, tzinfo=UTC)
 
 
 def _save_file(path: str, size: int = 512) -> SaveFile:
@@ -63,10 +63,11 @@ def cloud_manifest() -> GameManifest:
 @pytest.fixture()
 def sample_config() -> AppConfig:
     return AppConfig(
-        rclone_backend=RCLONE_BACKEND_S3,
-        rclone_remote="myremote",
-        s3_bucket="mybucket",
-        s3_prefix="myprefix",
+        drive_remote="myremote",
+        drive_root="my-root",
+        backup_path="myprefix",
+        drive_client_id="client-id",
+        drive_client_secret="client-secret",
         ludusavi_path="/usr/bin/ludusavi",
         rclone_path=None,
     )
@@ -334,10 +335,11 @@ def test_settings_dialog_populates_from_config(qtbot, sample_config):
     dlg = SettingsDialog(sample_config)
     qtbot.addWidget(dlg)
 
-    assert dlg._backend.currentData() == RCLONE_BACKEND_S3
-    assert dlg._rclone_remote.text() == "myremote"
-    assert dlg._s3_bucket.text() == "mybucket"
-    assert dlg._s3_prefix.text() == "myprefix"
+    assert dlg._drive_remote.text() == "myremote"
+    assert dlg._drive_root.text() == "my-root"
+    assert dlg._backup_path.text() == "myprefix"
+    assert dlg._drive_client_id.text() == "client-id"
+    assert dlg._drive_client_secret.text() == "client-secret"
     assert dlg._ludusavi_path.text() == "/usr/bin/ludusavi"
     assert dlg._rclone_path.text() == ""
 
@@ -347,37 +349,33 @@ def test_settings_dialog_get_config_returns_current_values(qtbot, sample_config)
     dlg = SettingsDialog(sample_config)
     qtbot.addWidget(dlg)
 
-    dlg._s3_bucket.setText("new-bucket")
-    dlg._rclone_remote.setText("other-remote")
+    dlg._drive_root.setText("new-root")
+    dlg._drive_remote.setText("other-remote")
 
     cfg = dlg.get_config()
 
-    assert cfg.rclone_backend == RCLONE_BACKEND_S3
-    assert cfg.s3_bucket == "new-bucket"
-    assert cfg.rclone_remote == "other-remote"
-    assert cfg.s3_prefix == "myprefix"  # unchanged
+    assert cfg.drive_root == "new-root"
+    assert cfg.drive_remote == "other-remote"
+    assert cfg.backup_path == "myprefix"  # unchanged
 
 
 def test_settings_dialog_defaults_to_google_drive(qtbot):
-    """A default config opens with Google Drive selected and gdrive prefilled."""
+    """A default config opens with Google Drive defaults and no saved token."""
     dlg = SettingsDialog(AppConfig())
     qtbot.addWidget(dlg)
 
-    assert dlg._backend.currentData() == "google_drive"
-    assert dlg._rclone_remote.text() == "gdrive"
-    assert dlg._s3_bucket_label.text() == "Drive Root Folder:"
+    assert dlg._drive_remote.text() == "gdrive"
+    assert "Not Connected" in dlg._connection_status.text()
 
 
-def test_settings_dialog_switching_to_google_drive_updates_default_remote(qtbot, sample_config):
-    """Switching providers swaps built-in default remote names."""
-    dlg = SettingsDialog(sample_config)
+def test_settings_dialog_detects_saved_drive_token(qtbot, tmp_path: Path):
+    """A saved remote in the app rclone config is surfaced in the status card."""
+    (tmp_path / "rclone.conf").write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+    dlg = SettingsDialog(AppConfig(), config_dir=tmp_path)
     qtbot.addWidget(dlg)
 
-    dlg._rclone_remote.setText("s3remote")
-    dlg._backend.setCurrentIndex(dlg._backend.findData("google_drive"))
-
-    assert dlg._rclone_remote.text() == "gdrive"
-    assert dlg._s3_bucket_label.text() == "Drive Root Folder:"
+    assert dlg.drive_is_connected() is True
+    assert "Saved Token" in dlg._connection_status.text()
 
 
 def test_settings_dialog_empty_paths_become_none(qtbot, sample_config):

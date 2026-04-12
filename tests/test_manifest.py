@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from savesync_bridge.core.manifest import compare, from_json, to_json
 from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncStatus
 
-_UTC = timezone.utc
+_UTC = UTC
 _T0 = datetime(2026, 4, 12, 10, 0, 0, tzinfo=_UTC)
 _T1 = _T0 + timedelta(hours=1)
 _T2 = _T0 + timedelta(hours=2)
@@ -78,13 +79,11 @@ def test_round_trip_platform_enum() -> None:
 
 
 def test_from_json_invalid_raises() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises((json.JSONDecodeError, KeyError, ValueError)):
         from_json("not valid json")
 
 
 def test_json_contains_expected_keys() -> None:
-    import json
-
     m = _manifest()
     obj = json.loads(to_json(m))
     assert "game_id" in obj

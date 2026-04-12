@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from PySide6.QtCore import Qt, Signal, Slot
-from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
     QSizePolicy,
-    QSplitter,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -89,7 +88,7 @@ class DebugPanel(QWidget):
     @Slot(str)
     def log_command(self, command: str) -> None:
         """Log a CLI command line (shown in accent colour)."""
-        ts = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
+        ts = datetime.now(tz=UTC).strftime("%H:%M:%S")
         html = (
             f'<span style="color:#6c7086">[{ts}]</span> '
             f'<span style="color:#cba6f7; font-weight:bold">$ {_ansi_to_html(command)}</span>'
@@ -124,7 +123,7 @@ class DebugPanel(QWidget):
     @Slot(str)
     def log_info(self, text: str) -> None:
         """Log an informational message (e.g. sync-engine events)."""
-        ts = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
+        ts = datetime.now(tz=UTC).strftime("%H:%M:%S")
         html = (
             f'<span style="color:#6c7086">[{ts}]</span> '
             f'<span style="color:#89b4fa">{_ansi_to_html(text)}</span>'
@@ -163,7 +162,10 @@ class DebugPanel(QWidget):
         h_layout.addWidget(self._toggle_icon)
 
         title = QLabel("Debug Console")
-        title.setStyleSheet("color: #cdd6f4; font-size: 10pt; font-weight: bold; padding-left: 6px;")
+        title.setStyleSheet(
+            "color: #cdd6f4; font-size: 10pt;"
+            " font-weight: bold; padding-left: 6px;"
+        )
         h_layout.addWidget(title)
 
         h_layout.addStretch()
@@ -222,7 +224,7 @@ class DebugPanel(QWidget):
 
         if self._expanded:
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            self.setFixedHeight(QWIDGETSIZE_MAX := 16777215)
+            self.setFixedHeight(16777215)
             self.setMinimumHeight(180)
             self.setMaximumHeight(16777215)
         else:

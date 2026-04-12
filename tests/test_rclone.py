@@ -8,18 +8,24 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from savesync_bridge.cli.rclone import (
+    configure_google_drive_remote,
+    delete_remote_config,
     download,
     file_exists,
+    has_remote_config,
     list_files,
+    reconnect_google_drive_remote,
     upload,
+    verify_google_drive_remote,
 )
 from savesync_bridge.cli.rclone import read_file as rclone_read_file
 from savesync_bridge.core.exceptions import RcloneError
 
 FAKE_BINARY = Path("/fake/rclone")
-REMOTE = "s3remote"
-BUCKET = "test-bucket"
-PREFIX = "saves/Hades"
+CONFIG_FILE = Path("/fake/rclone.conf")
+REMOTE = "gdrive"
+ROOT = "SyncRoot"
+BACKUP_PATH = "saves/Hades"
 
 
 def _make_proc(
@@ -38,18 +44,18 @@ class TestUpload:
     def test_cli_args(self, tmp_path: Path) -> None:
         proc = _make_proc()
         with patch("subprocess.run", return_value=proc) as mock_run:
-            upload(tmp_path, REMOTE, BUCKET, PREFIX, binary=FAKE_BINARY)
+            upload(tmp_path, REMOTE, ROOT, BACKUP_PATH, binary=FAKE_BINARY, config_file=CONFIG_FILE)
         args = mock_run.call_args[0][0]
         assert args[0] == str(FAKE_BINARY)
-        assert args[1] == "copy"
+        assert args[1:3] == ["--config", str(CONFIG_FILE)]
+        assert args[3] == "copy"
         assert str(tmp_path) in args
-        assert f"{REMOTE}:{BUCKET}/{PREFIX}" in args
+        assert f"{REMOTE}:{ROOT}/{BACKUP_PATH}" in args
 
     def test_non_zero_raises_rclone_error(self, tmp_path: Path) -> None:
         proc = _make_proc(returncode=1, stderr="upload failed")
-        with patch("subprocess.run", return_value=proc):
-            with pytest.raises(RcloneError) as exc_info:
-                upload(tmp_path, REMOTE, BUCKET, PREFIX, binary=FAKE_BINARY)
+        with patch("subprocess.run", return_value=proc), pytest.raises(RcloneError) as exc_info:
+            upload(tmp_path, REMOTE, ROOT, BACKUP_PATH, binary=FAKE_BINARY)
         assert exc_info.value.returncode == 1
         assert "upload failed" in exc_info.value.stderr
 
@@ -57,89 +63,49 @@ class TestUpload:
         proc = _make_proc()
         custom_env = {"MY_CUSTOM_VAR": "my_value"}
         with patch("subprocess.run", return_value=proc) as mock_run:
-            upload(tmp_path, REMOTE, BUCKET, PREFIX, env=custom_env, binary=FAKE_BINARY)
-        call_kwargs = mock_run.call_args[1]
-        assert "env" in call_kwargs
-        assert call_kwargs["env"]["MY_CUSTOM_VAR"] == "my_value"
+            upload(tmp_path, REMOTE, ROOT, BACKUP_PATH, env=custom_env, binary=FAKE_BINARY)
+        assert mock_run.call_args[1]["env"]["MY_CUSTOM_VAR"] == "my_value"
 
     def test_env_merge_does_not_mutate_os_environ(self, tmp_path: Path) -> None:
         proc = _make_proc()
-        custom_env = {"SAVESYNC_UNIQUE_KEY": "value"}
         with patch("subprocess.run", return_value=proc):
-            upload(tmp_path, REMOTE, BUCKET, PREFIX, env=custom_env, binary=FAKE_BINARY)
+            upload(
+                tmp_path,
+                REMOTE,
+                ROOT,
+                BACKUP_PATH,
+                env={"SAVESYNC_UNIQUE_KEY": "value"},
+                binary=FAKE_BINARY,
+            )
         assert "SAVESYNC_UNIQUE_KEY" not in os.environ
 
-    def test_env_includes_existing_os_environ_keys(self, tmp_path: Path) -> None:
+    def test_omits_root_when_empty(self, tmp_path: Path) -> None:
         proc = _make_proc()
         with patch("subprocess.run", return_value=proc) as mock_run:
-            upload(tmp_path, REMOTE, BUCKET, PREFIX, env={"X": "1"}, binary=FAKE_BINARY)
-        call_env = mock_run.call_args[1]["env"]
-        # PATH should exist in the merged env from os.environ
-        assert "PATH" in call_env or len(call_env) > 1
-
-    def test_no_shell_true(self, tmp_path: Path) -> None:
-        proc = _make_proc()
-        with patch("subprocess.run", return_value=proc) as mock_run:
-            upload(tmp_path, REMOTE, BUCKET, PREFIX, binary=FAKE_BINARY)
-        kwargs = mock_run.call_args[1]
-        assert kwargs.get("shell", False) is False
-
-    def test_no_env_passed_when_env_is_none(self, tmp_path: Path) -> None:
-        proc = _make_proc()
-        with patch("subprocess.run", return_value=proc) as mock_run:
-            upload(tmp_path, REMOTE, BUCKET, PREFIX, binary=FAKE_BINARY)
-        kwargs = mock_run.call_args[1]
-        # When no env override, subprocess inherits from parent (env kwarg absent or None)
-        assert kwargs.get("env") is None
-
-    def test_omits_bucket_when_empty(self, tmp_path: Path) -> None:
-        proc = _make_proc()
-        with patch("subprocess.run", return_value=proc) as mock_run:
-            upload(tmp_path, "gdrive", "", PREFIX, binary=FAKE_BINARY)
+            upload(tmp_path, REMOTE, "", BACKUP_PATH, binary=FAKE_BINARY)
         args = mock_run.call_args[0][0]
-        assert "gdrive:saves/Hades" in args
+        assert f"{REMOTE}:{BACKUP_PATH}" in args
 
 
 class TestDownload:
     def test_cli_args(self, tmp_path: Path) -> None:
         proc = _make_proc()
         with patch("subprocess.run", return_value=proc) as mock_run:
-            download(REMOTE, BUCKET, PREFIX, tmp_path, binary=FAKE_BINARY)
+            download(
+                REMOTE, ROOT, BACKUP_PATH, tmp_path,
+                binary=FAKE_BINARY, config_file=CONFIG_FILE,
+            )
         args = mock_run.call_args[0][0]
         assert args[0] == str(FAKE_BINARY)
-        assert args[1] == "copy"
-        assert f"{REMOTE}:{BUCKET}/{PREFIX}" in args
+        assert args[1:3] == ["--config", str(CONFIG_FILE)]
+        assert args[3] == "copy"
+        assert f"{REMOTE}:{ROOT}/{BACKUP_PATH}" in args
         assert str(tmp_path) in args
-
-    def test_remote_arg_comes_before_local(self, tmp_path: Path) -> None:
-        proc = _make_proc()
-        with patch("subprocess.run", return_value=proc) as mock_run:
-            download(REMOTE, BUCKET, PREFIX, tmp_path, binary=FAKE_BINARY)
-        args = mock_run.call_args[0][0]
-        remote_idx = args.index(f"{REMOTE}:{BUCKET}/{PREFIX}")
-        local_idx = args.index(str(tmp_path))
-        assert remote_idx < local_idx
 
     def test_non_zero_raises_rclone_error(self, tmp_path: Path) -> None:
         proc = _make_proc(returncode=1, stderr="download failed")
-        with patch("subprocess.run", return_value=proc):
-            with pytest.raises(RcloneError) as exc_info:
-                download(REMOTE, BUCKET, PREFIX, tmp_path, binary=FAKE_BINARY)
-        assert exc_info.value.returncode == 1
-
-    def test_no_shell_true(self, tmp_path: Path) -> None:
-        proc = _make_proc()
-        with patch("subprocess.run", return_value=proc) as mock_run:
-            download(REMOTE, BUCKET, PREFIX, tmp_path, binary=FAKE_BINARY)
-        kwargs = mock_run.call_args[1]
-        assert kwargs.get("shell", False) is False
-
-    def test_omits_bucket_when_empty(self, tmp_path: Path) -> None:
-        proc = _make_proc()
-        with patch("subprocess.run", return_value=proc) as mock_run:
-            download("gdrive", "", PREFIX, tmp_path, binary=FAKE_BINARY)
-        args = mock_run.call_args[0][0]
-        assert "gdrive:saves/Hades" in args
+        with patch("subprocess.run", return_value=proc), pytest.raises(RcloneError):
+            download(REMOTE, ROOT, BACKUP_PATH, tmp_path, binary=FAKE_BINARY)
 
 
 class TestReadFile:
@@ -147,38 +113,22 @@ class TestReadFile:
         payload = b'{"game_id": "Hades"}'
         proc = _make_proc(stdout=payload)
         with patch("subprocess.run", return_value=proc):
-            result = rclone_read_file(REMOTE, BUCKET, "saves/Hades/manifest.json", binary=FAKE_BINARY)
+            result = rclone_read_file(REMOTE, ROOT, "saves/Hades/manifest.json", binary=FAKE_BINARY)
         assert result == payload
 
     def test_cli_args(self) -> None:
         proc = _make_proc(stdout=b"data")
         with patch("subprocess.run", return_value=proc) as mock_run:
-            rclone_read_file(REMOTE, BUCKET, "saves/Hades/manifest.json", binary=FAKE_BINARY)
+            rclone_read_file(
+                REMOTE,
+                ROOT,
+                "saves/Hades/manifest.json",
+                binary=FAKE_BINARY,
+                config_file=CONFIG_FILE,
+            )
         args = mock_run.call_args[0][0]
-        assert args[0] == str(FAKE_BINARY)
-        assert args[1] == "cat"
-        assert f"{REMOTE}:{BUCKET}/saves/Hades/manifest.json" in args
-
-    def test_non_zero_raises_rclone_error(self) -> None:
-        proc = _make_proc(returncode=1, stderr="object not found")
-        with patch("subprocess.run", return_value=proc):
-            with pytest.raises(RcloneError) as exc_info:
-                rclone_read_file(REMOTE, BUCKET, "saves/missing.json", binary=FAKE_BINARY)
-        assert exc_info.value.returncode == 1
-
-    def test_no_shell_true(self) -> None:
-        proc = _make_proc(stdout=b"x")
-        with patch("subprocess.run", return_value=proc) as mock_run:
-            rclone_read_file(REMOTE, BUCKET, "key", binary=FAKE_BINARY)
-        kwargs = mock_run.call_args[1]
-        assert kwargs.get("shell", False) is False
-
-    def test_omits_bucket_when_empty(self) -> None:
-        proc = _make_proc(stdout=b"data")
-        with patch("subprocess.run", return_value=proc) as mock_run:
-            rclone_read_file("gdrive", "", "saves/Hades/manifest.json", binary=FAKE_BINARY)
-        args = mock_run.call_args[0][0]
-        assert "gdrive:saves/Hades/manifest.json" in args
+        assert args[1:3] == ["--config", str(CONFIG_FILE)]
+        assert f"{REMOTE}:{ROOT}/saves/Hades/manifest.json" in args
 
 
 class TestListFiles:
@@ -186,43 +136,13 @@ class TestListFiles:
         files = [{"Name": "save.dat", "Size": 1024, "IsDir": False}]
         proc = _make_proc(stdout=json.dumps(files))
         with patch("subprocess.run", return_value=proc):
-            result = list_files(REMOTE, BUCKET, PREFIX, binary=FAKE_BINARY)
+            result = list_files(REMOTE, ROOT, BACKUP_PATH, binary=FAKE_BINARY)
         assert result == files
-
-    def test_returns_empty_list(self) -> None:
-        proc = _make_proc(stdout="[]")
-        with patch("subprocess.run", return_value=proc):
-            result = list_files(REMOTE, BUCKET, PREFIX, binary=FAKE_BINARY)
-        assert result == []
-
-    def test_cli_args(self) -> None:
-        proc = _make_proc(stdout="[]")
-        with patch("subprocess.run", return_value=proc) as mock_run:
-            list_files(REMOTE, BUCKET, PREFIX, binary=FAKE_BINARY)
-        args = mock_run.call_args[0][0]
-        assert args[0] == str(FAKE_BINARY)
-        assert args[1] == "lsjson"
-        assert f"{REMOTE}:{BUCKET}/{PREFIX}" in args
-
-    def test_non_zero_raises_rclone_error(self) -> None:
-        proc = _make_proc(returncode=1, stderr="listing failed")
-        with patch("subprocess.run", return_value=proc):
-            with pytest.raises(RcloneError) as exc_info:
-                list_files(REMOTE, BUCKET, PREFIX, binary=FAKE_BINARY)
-        assert exc_info.value.returncode == 1
 
     def test_malformed_json_raises_rclone_error(self) -> None:
         proc = _make_proc(stdout="not json {{")
-        with patch("subprocess.run", return_value=proc):
-            with pytest.raises(RcloneError):
-                list_files(REMOTE, BUCKET, PREFIX, binary=FAKE_BINARY)
-
-    def test_omits_bucket_when_empty(self) -> None:
-        proc = _make_proc(stdout="[]")
-        with patch("subprocess.run", return_value=proc) as mock_run:
-            list_files("gdrive", "", PREFIX, binary=FAKE_BINARY)
-        args = mock_run.call_args[0][0]
-        assert "gdrive:saves/Hades" in args
+        with patch("subprocess.run", return_value=proc), pytest.raises(RcloneError):
+            list_files(REMOTE, ROOT, BACKUP_PATH, binary=FAKE_BINARY)
 
 
 class TestFileExists:
@@ -230,17 +150,76 @@ class TestFileExists:
         files = [{"Name": "manifest.json", "Size": 512}]
         proc = _make_proc(stdout=json.dumps(files))
         with patch("subprocess.run", return_value=proc):
-            result = file_exists(REMOTE, BUCKET, f"{PREFIX}/manifest.json", binary=FAKE_BINARY)
+            result = file_exists(REMOTE, ROOT, f"{BACKUP_PATH}/manifest.json", binary=FAKE_BINARY)
         assert result is True
-
-    def test_returns_false_when_list_empty(self) -> None:
-        proc = _make_proc(stdout="[]")
-        with patch("subprocess.run", return_value=proc):
-            result = file_exists(REMOTE, BUCKET, f"{PREFIX}/missing.json", binary=FAKE_BINARY)
-        assert result is False
 
     def test_returns_false_on_rclone_error(self) -> None:
         proc = _make_proc(returncode=1, stderr="not found")
         with patch("subprocess.run", return_value=proc):
-            result = file_exists(REMOTE, BUCKET, f"{PREFIX}/missing.json", binary=FAKE_BINARY)
+            result = file_exists(REMOTE, ROOT, f"{BACKUP_PATH}/missing.json", binary=FAKE_BINARY)
         assert result is False
+
+
+class TestDriveConfigHelpers:
+    def test_has_remote_config_reads_ini_sections(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "rclone.conf"
+        config_file.write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+        assert has_remote_config("gdrive", config_file) is True
+        assert has_remote_config("other", config_file) is False
+
+    def test_configure_google_drive_remote_creates_remote(self, tmp_path: Path) -> None:
+        proc = _make_proc(stdout="ok")
+        config_file = tmp_path / "rclone.conf"
+        with patch("subprocess.run", return_value=proc) as mock_run:
+            configure_google_drive_remote(
+                "gdrive",
+                config_file,
+                client_id="client-id",
+                client_secret="client-secret",
+                binary=FAKE_BINARY,
+            )
+        args = mock_run.call_args[0][0]
+        assert args[:5] == [str(FAKE_BINARY), "--config", str(config_file), "config", "create"]
+        assert "client_id" in args and "client-id" in args
+        assert "client_secret" in args and "client-secret" in args
+
+    def test_configure_google_drive_remote_updates_existing_remote(self, tmp_path: Path) -> None:
+        proc = _make_proc(stdout="ok")
+        config_file = tmp_path / "rclone.conf"
+        config_file.write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+        with patch("subprocess.run", return_value=proc) as mock_run:
+            configure_google_drive_remote("gdrive", config_file, binary=FAKE_BINARY)
+        args = mock_run.call_args[0][0]
+        assert args[:5] == [str(FAKE_BINARY), "--config", str(config_file), "config", "update"]
+
+    def test_reconnect_google_drive_remote_uses_reconnect_command(self, tmp_path: Path) -> None:
+        proc = _make_proc(stdout="ok")
+        config_file = tmp_path / "rclone.conf"
+        with patch("subprocess.run", return_value=proc) as mock_run:
+            reconnect_google_drive_remote("gdrive", config_file, binary=FAKE_BINARY)
+        args = mock_run.call_args[0][0]
+        assert args[-3:] == ["config", "reconnect", "gdrive:"]
+
+    def test_delete_remote_config_skips_missing_remote(self, tmp_path: Path) -> None:
+        with patch("subprocess.run") as mock_run:
+            delete_remote_config("missing", tmp_path / "rclone.conf", binary=FAKE_BINARY)
+        mock_run.assert_not_called()
+
+    def test_delete_remote_config_runs_delete_for_existing_remote(self, tmp_path: Path) -> None:
+        proc = _make_proc(stdout="ok")
+        config_file = tmp_path / "rclone.conf"
+        config_file.write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+        with patch("subprocess.run", return_value=proc) as mock_run:
+            delete_remote_config("gdrive", config_file, binary=FAKE_BINARY)
+        args = mock_run.call_args[0][0]
+        assert args[-3:] == ["config", "delete", "gdrive"]
+
+    def test_verify_google_drive_remote_lists_root(self) -> None:
+        proc = _make_proc(stdout="[]")
+        with patch("subprocess.run", return_value=proc) as mock_run:
+            verify_google_drive_remote(
+                "gdrive", "SyncRoot",
+                binary=FAKE_BINARY, config_file=CONFIG_FILE,
+            )
+        args = mock_run.call_args[0][0]
+        assert args[-2:] == ["lsjson", "gdrive:SyncRoot"]

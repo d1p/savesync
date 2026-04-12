@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from savesync_bridge.core import manifest as manifest_module
-from savesync_bridge.core.config import RCLONE_BACKEND_S3, AppConfig
+from savesync_bridge.core.config import AppConfig
 from savesync_bridge.core.exceptions import LudusaviError, RcloneError
 from savesync_bridge.core.sync_engine import SyncEngine, SyncResult
 from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncStatus
@@ -17,10 +17,9 @@ GAME_ID = "Hades"
 
 def _make_config() -> AppConfig:
     return AppConfig(
-        rclone_backend=RCLONE_BACKEND_S3,
-        rclone_remote="s3remote",
-        s3_bucket="test-bucket",
-        s3_prefix="saves",
+        drive_remote="gdrive",
+        drive_root="test-root",
+        backup_path="saves",
     )
 
 

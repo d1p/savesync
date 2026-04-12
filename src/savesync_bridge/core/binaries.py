@@ -13,7 +13,7 @@ def _bin_dir() -> Path:
     """
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         # PyInstaller one-file: _MEIPASS/<platform>/
-        return Path(sys._MEIPASS) / "bin"  # type: ignore[attr-defined]  # noqa: SLF001
+        return Path(sys._MEIPASS) / "bin"  # type: ignore[attr-defined]
     # Development / editable install
     return Path(__file__).parent.parent / "bin"
 

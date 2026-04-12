@@ -269,13 +269,16 @@ Stored as TOML:
 
 Fields:
 
-- `rclone_backend`
-- `rclone_remote`
-- `s3_bucket`
-- `s3_prefix`
+- `drive_remote`
+- `drive_root`
+- `backup_path`
+- `drive_client_id`
+- `drive_client_secret`
 - `ludusavi_path`
 - `rclone_path`
 - `known_games`
+
+The app also maintains an rclone config file beside `config.toml` to persist the Google Drive OAuth token.
 
 ### Local state cache
 
@@ -291,7 +294,7 @@ These files are not saves. They are comparison metadata.
 Remote layout for each game:
 
 ```text
-<s3_prefix>/<game_id>/
+<backup_path>/<game_id>/
 ```
 
 Contents:
@@ -317,10 +320,13 @@ Implemented in `cli/ludusavi.py`.
 
 Implemented in `cli/rclone.py`.
 
-- `upload()` -> `rclone copy <local> <remote>:<bucket-or-root>/<prefix>`
-- `download()` -> `rclone copy <remote>:<bucket-or-root>/<prefix> <local>`
-- `read_file()` -> `rclone cat <remote>:<bucket-or-root>/<key>`
-- `list_files()` -> `rclone lsjson <remote>:<bucket-or-root>/<prefix>`
+- `upload()` -> `rclone --config <app-rclone.conf> copy <local> <remote>:<drive-root>/<path>`
+- `download()` -> `rclone --config <app-rclone.conf> copy <remote>:<drive-root>/<path> <local>`
+- `read_file()` -> `rclone --config <app-rclone.conf> cat <remote>:<drive-root>/<key>`
+- `list_files()` -> `rclone --config <app-rclone.conf> lsjson <remote>:<drive-root>/<path>`
+- `configure_google_drive_remote()` -> creates or updates a `drive` remote and saves the OAuth token into the app-owned `rclone.conf`
+- `reconnect_google_drive_remote()` -> refreshes the token with rclone's browser-based OAuth flow
+- `delete_remote_config()` -> removes the stored remote and token from the app-owned rclone config
 
 The wrapper can merge extra environment variables into the subprocess environment so credentials loaded from `.env` are inherited by rclone.
 

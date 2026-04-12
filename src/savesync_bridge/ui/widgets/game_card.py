@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -20,7 +20,7 @@ def _format_last_sync(game: Game) -> str:
     if game.local_manifest is None:
         return "Never synced"
     ts = game.local_manifest.timestamp
-    now = datetime.now(tz=timezone.utc)
+    now = datetime.now(tz=UTC)
     delta = now - ts
     seconds = int(delta.total_seconds())
     if seconds < 60:

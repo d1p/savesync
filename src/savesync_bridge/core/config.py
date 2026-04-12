@@ -6,31 +6,23 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-
-RCLONE_BACKEND_GOOGLE_DRIVE = "google_drive"
-RCLONE_BACKEND_S3 = "s3"
-SUPPORTED_RCLONE_BACKENDS = (
-    RCLONE_BACKEND_GOOGLE_DRIVE,
-    RCLONE_BACKEND_S3,
-)
-DEFAULT_RCLONE_REMOTE_BY_BACKEND = {
-    RCLONE_BACKEND_GOOGLE_DRIVE: "gdrive",
-    RCLONE_BACKEND_S3: "s3remote",
-}
+DEFAULT_DRIVE_REMOTE = "gdrive"
+DEFAULT_BACKUP_PATH = "savesync-bridge"
 
 
 @dataclass
 class AppConfig:
-    rclone_backend: str = RCLONE_BACKEND_GOOGLE_DRIVE
-    rclone_remote: str = DEFAULT_RCLONE_REMOTE_BY_BACKEND[RCLONE_BACKEND_GOOGLE_DRIVE]
-    s3_bucket: str = ""
-    s3_prefix: str = "savesync-bridge"
+    drive_remote: str = DEFAULT_DRIVE_REMOTE
+    drive_root: str = ""
+    backup_path: str = DEFAULT_BACKUP_PATH
+    drive_client_id: str | None = None
+    drive_client_secret: str | None = None
     ludusavi_path: str | None = None
     rclone_path: str | None = None
     known_games: list[str] = field(default_factory=list)
 
 
-def _default_config_dir() -> Path:
+def default_config_dir() -> Path:
     if sys.platform == "win32":
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
     else:
@@ -42,12 +34,10 @@ def _config_file(config_dir: Path) -> Path:
     return config_dir / "config.toml"
 
 
-def _coerce_rclone_backend(raw_value: object, bucket: str) -> str:
-    if isinstance(raw_value, str) and raw_value in SUPPORTED_RCLONE_BACKENDS:
-        return raw_value
-    if bucket.strip():
-        return RCLONE_BACKEND_S3
-    return RCLONE_BACKEND_GOOGLE_DRIVE
+def rclone_config_path(config_dir: Path | None = None) -> Path:
+    if config_dir is None:
+        config_dir = default_config_dir()
+    return config_dir / "rclone.conf"
 
 
 def load_config(config_dir: Path | None = None) -> AppConfig:
@@ -62,7 +52,7 @@ def load_config(config_dir: Path | None = None) -> AppConfig:
         exist.
     """
     if config_dir is None:
-        config_dir = _default_config_dir()
+        config_dir = default_config_dir()
 
     cfg_file = _config_file(config_dir)
     if not cfg_file.exists():
@@ -71,14 +61,12 @@ def load_config(config_dir: Path | None = None) -> AppConfig:
     with cfg_file.open("rb") as fh:
         data = tomllib.load(fh)
 
-    backend = _coerce_rclone_backend(data.get("rclone_backend"), data.get("s3_bucket", ""))
-    default_remote = DEFAULT_RCLONE_REMOTE_BY_BACKEND[backend]
-
     return AppConfig(
-        rclone_backend=backend,
-        rclone_remote=data.get("rclone_remote", default_remote),
-        s3_bucket=data.get("s3_bucket", ""),
-        s3_prefix=data.get("s3_prefix", "savesync-bridge"),
+        drive_remote=data.get("drive_remote", data.get("rclone_remote", DEFAULT_DRIVE_REMOTE)),
+        drive_root=data.get("drive_root", data.get("s3_bucket", "")),
+        backup_path=data.get("backup_path", data.get("s3_prefix", DEFAULT_BACKUP_PATH)),
+        drive_client_id=data.get("drive_client_id"),
+        drive_client_secret=data.get("drive_client_secret"),
         ludusavi_path=data.get("ludusavi_path"),
         rclone_path=data.get("rclone_path"),
         known_games=list(data.get("known_games", [])),
@@ -94,7 +82,7 @@ def save_config(cfg: AppConfig, config_dir: Path | None = None) -> None:
             config directory. Created automatically if absent.
     """
     if config_dir is None:
-        config_dir = _default_config_dir()
+        config_dir = default_config_dir()
 
     config_dir.mkdir(parents=True, exist_ok=True)
     cfg_file = _config_file(config_dir)
@@ -119,11 +107,14 @@ def _toml_array_of_str(values: list[str]) -> str:
 
 def _to_toml(cfg: AppConfig) -> str:
     lines: list[str] = [
-        f"rclone_backend = {_toml_str(cfg.rclone_backend)}",
-        f"rclone_remote = {_toml_str(cfg.rclone_remote)}",
-        f"s3_bucket = {_toml_str(cfg.s3_bucket)}",
-        f"s3_prefix = {_toml_str(cfg.s3_prefix)}",
+        f"drive_remote = {_toml_str(cfg.drive_remote)}",
+        f"drive_root = {_toml_str(cfg.drive_root)}",
+        f"backup_path = {_toml_str(cfg.backup_path)}",
     ]
+    if cfg.drive_client_id is not None:
+        lines.append(f"drive_client_id = {_toml_str(cfg.drive_client_id)}")
+    if cfg.drive_client_secret is not None:
+        lines.append(f"drive_client_secret = {_toml_str(cfg.drive_client_secret)}")
     if cfg.ludusavi_path is not None:
         lines.append(f"ludusavi_path = {_toml_str(cfg.ludusavi_path)}")
     if cfg.rclone_path is not None:

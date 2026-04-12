@@ -7,8 +7,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from savesync_bridge.cli.ludusavi import (
-    LudusaviGame,
-    SaveFileInfo,
     backup_game,
     list_games,
     restore_game,
@@ -98,7 +96,10 @@ class TestListGames:
         assert len(hades.save_files) == 1
         assert hades.save_files[0].size == 2048
         assert hades.save_files[0].hash == ""
-        assert hades.save_paths == [str(Path("C:/Users/user/AppData/Roaming/Supergiant Games/Hades/Profiles"))]
+        expected = str(
+            Path("C:/Users/user/AppData/Roaming/Supergiant Games/Hades/Profiles")
+        )
+        assert hades.save_paths == [expected]
 
     def test_stardew_has_no_save_files(self) -> None:
         proc = _make_proc(stdout=json.dumps(BACKUP_PREVIEW_JSON))
@@ -125,17 +126,15 @@ class TestListGames:
 
     def test_non_zero_exit_raises_ludusavi_error(self) -> None:
         proc = _make_proc(returncode=1, stderr="fatal error")
-        with patch("subprocess.run", return_value=proc):
-            with pytest.raises(LudusaviError) as exc_info:
-                list_games(binary=FAKE_BINARY)
+        with patch("subprocess.run", return_value=proc), pytest.raises(LudusaviError) as exc_info:
+            list_games(binary=FAKE_BINARY)
         assert exc_info.value.returncode == 1
         assert "fatal error" in exc_info.value.stderr
 
     def test_malformed_json_raises_ludusavi_error(self) -> None:
         proc = _make_proc(stdout="not valid json {{")
-        with patch("subprocess.run", return_value=proc):
-            with pytest.raises(LudusaviError):
-                list_games(binary=FAKE_BINARY)
+        with patch("subprocess.run", return_value=proc), pytest.raises(LudusaviError):
+            list_games(binary=FAKE_BINARY)
 
     def test_empty_games_dict_returns_empty_list(self) -> None:
         proc = _make_proc(stdout=json.dumps({"overall": {}, "games": {}}))
@@ -174,17 +173,15 @@ class TestBackupGame:
 
     def test_non_zero_exit_raises_ludusavi_error(self, tmp_path: Path) -> None:
         proc = _make_proc(returncode=2, stderr="backup failed")
-        with patch("subprocess.run", return_value=proc):
-            with pytest.raises(LudusaviError) as exc_info:
-                backup_game("Hades", tmp_path, binary=FAKE_BINARY)
+        with patch("subprocess.run", return_value=proc), pytest.raises(LudusaviError) as exc_info:
+            backup_game("Hades", tmp_path, binary=FAKE_BINARY)
         assert exc_info.value.returncode == 2
         assert "backup failed" in exc_info.value.stderr
 
     def test_malformed_json_raises_ludusavi_error(self, tmp_path: Path) -> None:
         proc = _make_proc(stdout="{bad json{{")
-        with patch("subprocess.run", return_value=proc):
-            with pytest.raises(LudusaviError):
-                backup_game("Hades", tmp_path, binary=FAKE_BINARY)
+        with patch("subprocess.run", return_value=proc), pytest.raises(LudusaviError):
+            backup_game("Hades", tmp_path, binary=FAKE_BINARY)
 
 
 class TestRestoreGame:
@@ -217,8 +214,7 @@ class TestRestoreGame:
 
     def test_non_zero_exit_raises_ludusavi_error(self, tmp_path: Path) -> None:
         proc = _make_proc(returncode=1, stderr="restore failed")
-        with patch("subprocess.run", return_value=proc):
-            with pytest.raises(LudusaviError) as exc_info:
-                restore_game("Hades", tmp_path, binary=FAKE_BINARY)
+        with patch("subprocess.run", return_value=proc), pytest.raises(LudusaviError) as exc_info:
+            restore_game("Hades", tmp_path, binary=FAKE_BINARY)
         assert exc_info.value.returncode == 1
         assert "restore failed" in exc_info.value.stderr

@@ -70,6 +70,7 @@ class SyncEngine:
         env: dict[str, str] | None = None,
         ludusavi_bin: Path | None = None,
         rclone_bin: Path | None = None,
+        rclone_config_file: Path | None = None,
         work_dir: Path | None = None,
         state_dir: Path | None = None,
     ) -> None:
@@ -77,6 +78,7 @@ class SyncEngine:
         self._env = env
         self._ludusavi_bin = ludusavi_bin
         self._rclone_bin = rclone_bin
+        self._rclone_config_file = rclone_config_file
         self._work_dir = work_dir
         self._state_dir: Path = state_dir if state_dir is not None else _default_state_dir()
 
@@ -84,13 +86,20 @@ class SyncEngine:
     # Private helpers
     # ------------------------------------------------------------------
 
+    @property
+    def ludusavi_bin(self) -> Path | None:
+        return self._ludusavi_bin
+
     def _cloud_prefix(self, game_id: str) -> str:
-        return f"{self._config.s3_prefix}/{game_id}"
+        return f"{self._config.backup_path}/{game_id}"
+
+    def update_config(self, config: AppConfig) -> None:
+        self._config = config
 
     def _local_manifest_path(self, game_id: str) -> Path:
         return self._state_dir / f"{game_id}.json"
 
-    def _get_local_manifest(self, game_id: str) -> GameManifest | None:
+    def get_local_manifest(self, game_id: str) -> GameManifest | None:
         path = self._local_manifest_path(game_id)
         if not path.exists():
             return None
@@ -98,6 +107,9 @@ class SyncEngine:
             return manifest_module.from_json(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, KeyError, ValueError):
             return None
+
+    # Backward-compatible alias
+    _get_local_manifest = get_local_manifest
 
     def _save_local_manifest(self, m: GameManifest) -> None:
         self._state_dir.mkdir(parents=True, exist_ok=True)
@@ -134,11 +146,12 @@ class SyncEngine:
         key = f"{self._cloud_prefix(game_id)}/manifest.json"
         try:
             raw = rclone.read_file(
-                self._config.rclone_remote,
-                self._config.s3_bucket,
+                self._config.drive_remote,
+                self._config.drive_root,
                 key,
                 env=self._env,
                 binary=self._rclone_bin,
+                config_file=self._rclone_config_file,
             )
             return manifest_module.from_json(raw.decode("utf-8"))
         except RcloneError:
@@ -174,21 +187,23 @@ class SyncEngine:
                 # 4. Upload game-save files
                 rclone.upload(
                     game_dir,
-                    self._config.rclone_remote,
-                    self._config.s3_bucket,
+                    self._config.drive_remote,
+                    self._config.drive_root,
                     prefix,
                     env=self._env,
                     binary=self._rclone_bin,
+                    config_file=self._rclone_config_file,
                 )
 
                 # 5. Upload manifest.json
                 rclone.upload(
                     manifest_file,
-                    self._config.rclone_remote,
-                    self._config.s3_bucket,
+                    self._config.drive_remote,
+                    self._config.drive_root,
                     prefix,
                     env=self._env,
                     binary=self._rclone_bin,
+                    config_file=self._rclone_config_file,
                 )
 
                 # 6. Persist manifest locally so check_status can diff later
@@ -225,12 +240,13 @@ class SyncEngine:
 
                 # 1. Download from S3
                 rclone.download(
-                    self._config.rclone_remote,
-                    self._config.s3_bucket,
+                    self._config.drive_remote,
+                    self._config.drive_root,
                     prefix,
                     game_dir,
                     env=self._env,
                     binary=self._rclone_bin,
+                    config_file=self._rclone_config_file,
                 )
 
                 convert_simple_backup_for_restore(

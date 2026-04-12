@@ -14,17 +14,17 @@ def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:  # type: igno
     try:
         from savesync_bridge.core.cli_bus import cli_bus
         cli_bus.command_run.emit(" ".join(str(c) for c in cmd))
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     result = subprocess.run(cmd, **kwargs)
     try:
-        from savesync_bridge.core.cli_bus import cli_bus  # noqa: F811
+        from savesync_bridge.core.cli_bus import cli_bus
         if result.stdout and isinstance(result.stdout, str):
             cli_bus.stdout_line.emit(result.stdout.strip())
         if result.stderr and isinstance(result.stderr, str):
             cli_bus.stderr_line.emit(result.stderr.strip())
         cli_bus.exit_code.emit(result.returncode)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return result
 

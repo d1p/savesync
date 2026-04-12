@@ -16,12 +16,9 @@ def load_env(env_file: Path | None = None) -> None:
             ``<cwd>/.env``.  A missing file is silently ignored.
 
     Expected keys (all optional):
-        - ``RCLONE_CONFIG_S3_TYPE``
-        - ``RCLONE_CONFIG_S3_PROVIDER``
-        - ``RCLONE_CONFIG_S3_ACCESS_KEY_ID``
-        - ``RCLONE_CONFIG_S3_SECRET_ACCESS_KEY``
-        - ``RCLONE_CONFIG_S3_REGION``
-        - ``RCLONE_CONFIG_S3_ENDPOINT``
+        - ``RCLONE_DRIVE_CLIENT_ID``
+        - ``RCLONE_DRIVE_CLIENT_SECRET``
+        - ``RCLONE_DRIVE_SCOPE``
     """
     if env_file is None:
         env_file = Path.cwd() / ".env"

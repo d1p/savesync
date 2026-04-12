@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFrame,
@@ -14,7 +16,13 @@ from PySide6.QtWidgets import (
 )
 
 from savesync_bridge.cli.ludusavi import LudusaviGame
-from savesync_bridge.core.config import AppConfig, save_config
+from savesync_bridge.cli.rclone import has_remote_config
+from savesync_bridge.core.config import (
+    AppConfig,
+    default_config_dir,
+    rclone_config_path,
+    save_config,
+)
 from savesync_bridge.core.path_translator import extract_wine_prefix_metadata
 from savesync_bridge.core.sync_engine import SyncEngine, SyncResult
 from savesync_bridge.models.game import Game, GameManifest, SyncStatus
@@ -22,7 +30,13 @@ from savesync_bridge.ui.conflict_dialog import ConflictDialog
 from savesync_bridge.ui.settings_dialog import SettingsDialog
 from savesync_bridge.ui.widgets.debug_panel import DebugPanel
 from savesync_bridge.ui.widgets.game_list import GameListWidget
-from savesync_bridge.ui.workers import PullWorker, PushWorker, ScanWorker, SyncWorker
+from savesync_bridge.ui.workers import (
+    FetchCloudManifestWorker,
+    PullWorker,
+    PushWorker,
+    ScanWorker,
+    SyncWorker,
+)
 
 
 def _ludusavi_to_game(lg: LudusaviGame) -> Game:
@@ -40,11 +54,15 @@ def _ludusavi_to_game(lg: LudusaviGame) -> Game:
 class MainWindow(QMainWindow):
     """Main application window — Sync Center."""
 
-    def __init__(self, config: AppConfig, engine: SyncEngine) -> None:
+    def __init__(
+        self, config: AppConfig, engine: SyncEngine, config_dir: Path | None = None,
+    ) -> None:
         super().__init__()
         self._config = config
         self._engine = engine
         self._games: dict[str, Game] = {}
+        self._config_dir = config_dir if config_dir is not None else default_config_dir()
+        self._rclone_config_file = rclone_config_path(self._config_dir)
 
         self.setWindowTitle("SaveSync-Bridge")
         self.setMinimumSize(960, 640)
@@ -52,6 +70,7 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_central()
         self._connect_signals()
+        self._refresh_backup_panel()
         self._debug.log_info("SaveSync-Bridge started — click ▶ to expand console")
 
     # ------------------------------------------------------------------
@@ -68,7 +87,7 @@ class MainWindow(QMainWindow):
         self._push_all_action = toolbar.addAction("⬆  Push All")
         self._pull_all_action = toolbar.addAction("⬇  Pull All")
         toolbar.addSeparator()
-        self._settings_action = toolbar.addAction("⚙  Settings")
+        self._settings_action = toolbar.addAction("☁  Backups")
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -148,9 +167,50 @@ class MainWindow(QMainWindow):
         sidebar_layout.addStretch()
         top_layout.addWidget(sidebar)
 
-        # ---- Game list ----
         self._game_list = GameListWidget()
-        top_layout.addWidget(self._game_list)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+
+        backup_panel = QFrame()
+        backup_panel.setObjectName("backup_panel")
+        backup_panel.setStyleSheet(
+            "QFrame#backup_panel {"
+            "background-color: #181825; border-bottom: 1px solid #45475a;"
+            "padding: 12px 16px;"
+            "}"
+        )
+        backup_layout = QHBoxLayout(backup_panel)
+        backup_layout.setContentsMargins(16, 14, 16, 14)
+        backup_layout.setSpacing(16)
+
+        summary_col = QVBoxLayout()
+        summary_col.setSpacing(4)
+        backup_title = QLabel("Backup Destination")
+        backup_title.setStyleSheet("font-size: 12pt; font-weight: bold; color: #cba6f7;")
+        summary_col.addWidget(backup_title)
+
+        self._backup_status_label = QLabel()
+        summary_col.addWidget(self._backup_status_label)
+
+        self._backup_target_label = QLabel()
+        self._backup_target_label.setStyleSheet("color: #bac2de;")
+        summary_col.addWidget(self._backup_target_label)
+
+        self._backup_token_label = QLabel()
+        self._backup_token_label.setStyleSheet("color: #6c7086; font-size: 10pt;")
+        summary_col.addWidget(self._backup_token_label)
+        backup_layout.addLayout(summary_col)
+        backup_layout.addStretch()
+
+        manage_backups_btn = QPushButton("Manage Backups")
+        manage_backups_btn.clicked.connect(self._on_settings)
+        backup_layout.addWidget(manage_backups_btn)
+
+        content_layout.addWidget(backup_panel)
+        content_layout.addWidget(self._game_list)
+        top_layout.addWidget(content)
 
         # ---- Debug panel ----
         self._debug = DebugPanel()
@@ -228,17 +288,17 @@ class MainWindow(QMainWindow):
 
     def _on_pull_all(self) -> None:
         for game_id in list(self._games.keys()):
-            cloud = self._engine.get_cloud_manifest(game_id)
-            if cloud is not None:
-                self._start_pull(game_id, cloud)
+            self._on_pull_game(game_id)
 
     def _on_settings(self) -> None:
         from PySide6.QtWidgets import QDialog
 
-        dlg = SettingsDialog(self._config, parent=self)
+        dlg = SettingsDialog(self._config, config_dir=self._config_dir, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._config = dlg.get_config()
-            save_config(self._config)
+            save_config(self._config, config_dir=self._config_dir)
+            self._engine.update_config(self._config)
+            self._refresh_backup_panel(verified=dlg.drive_was_verified())
 
     # ------------------------------------------------------------------
     # Game-card slots
@@ -257,11 +317,17 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_pull_game(self, game_id: str) -> None:
-        cloud = self._engine.get_cloud_manifest(game_id)
+        self._set_status(f"Fetching cloud manifest for '{game_id}'…")
+        worker = FetchCloudManifestWorker(self._engine, game_id, parent=self)
+        worker.manifest_ready.connect(self._on_cloud_manifest_fetched)
+        worker.error.connect(self._on_worker_error)
+        worker.start()
+
+    def _on_cloud_manifest_fetched(self, game_id: str, cloud: object) -> None:
         if cloud is None:
             self._set_status(f"No cloud save found for '{game_id}'")
             return
-        self._start_pull(game_id, cloud)
+        self._start_pull(game_id, cloud)  # type: ignore[arg-type]
 
     def _on_details_game(self, game_id: str) -> None:
         """Trigger a smart sync for the game; shows conflict dialog if needed."""
@@ -367,3 +433,24 @@ class MainWindow(QMainWindow):
 
     def _set_status(self, msg: str) -> None:
         self._status_label.setText(msg)
+
+    def _refresh_backup_panel(self, verified: bool = False) -> None:
+        connected = has_remote_config(self._config.drive_remote, self._rclone_config_file)
+
+        if connected and verified:
+            self._backup_status_label.setText("Google Drive connected and verified")
+            self._backup_status_label.setStyleSheet("color: #a6e3a1; font-weight: bold;")
+        elif connected:
+            self._backup_status_label.setText("Google Drive token saved")
+            self._backup_status_label.setStyleSheet("color: #fab387; font-weight: bold;")
+        else:
+            self._backup_status_label.setText("Google Drive not connected")
+            self._backup_status_label.setStyleSheet("color: #89b4fa; font-weight: bold;")
+
+        target_root = self._config.drive_root or "/"
+        remote = self._config.drive_remote
+        lib = self._config.backup_path
+        self._backup_target_label.setText(
+            f"Remote: {remote}:{target_root}  •  Backup library: {lib}"
+        )
+        self._backup_token_label.setText(f"Token store: {self._rclone_config_file}")

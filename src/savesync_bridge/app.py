@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import sys
 
@@ -9,10 +10,8 @@ def _fix_stdio() -> None:
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name)
         if stream is not None and hasattr(stream, "reconfigure"):
-            try:
+            with contextlib.suppress(Exception):
                 stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
         elif stream is not None and hasattr(stream, "buffer"):
             setattr(
                 sys,
@@ -39,15 +38,16 @@ def main() -> int:
 
     apply_theme(app)
 
-    from savesync_bridge.core.config import load_config
+    from savesync_bridge.core.config import default_config_dir, load_config, rclone_config_path
     from savesync_bridge.core.sync_engine import SyncEngine
 
-    config = load_config()
-    engine = SyncEngine(config=config)
+    config_dir = default_config_dir()
+    config = load_config(config_dir=config_dir)
+    engine = SyncEngine(config=config, rclone_config_file=rclone_config_path(config_dir))
 
     from savesync_bridge.ui.main_window import MainWindow
 
-    window = MainWindow(config=config, engine=engine)
+    window = MainWindow(config=config, engine=engine, config_dir=config_dir)
     window.show()
 
     return app.exec()

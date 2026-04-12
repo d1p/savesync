@@ -9,7 +9,7 @@ The app makes decisions at the game level, not at the individual-file level. Whe
 SaveSync-Bridge combines three things:
 
 - Ludusavi discovers save files and performs backup and restore operations.
-- rclone uploads and downloads those backup files to cloud storage such as Google Drive or S3-compatible remotes.
+- rclone uploads and downloads those backup files to Google Drive.
 - SaveSync-Bridge stores a local manifest per game so it can decide whether your local copy or the cloud copy should win.
 
 ## Core Model
@@ -24,36 +24,47 @@ For each game, the app tracks one of these states:
 
 ## Setup
 
-## 1. Configure credentials
+## 1. Optional client credentials
 
-The app loads `.env` from the current working directory on startup. For Google Drive remotes already configured in rclone, you may not need any extra environment variables. Typical S3 keys are:
+The app can authenticate Google Drive by itself using rclone's browser flow. Most users do not need a `.env` file at all.
+
+If you created your own Google OAuth desktop app and want SaveSync-Bridge to use it instead of rclone's shared client, optional environment variables are:
 
 ```env
-RCLONE_CONFIG_S3_TYPE=s3
-RCLONE_CONFIG_S3_PROVIDER=AWS
-RCLONE_CONFIG_S3_ACCESS_KEY_ID=...
-RCLONE_CONFIG_S3_SECRET_ACCESS_KEY=...
-RCLONE_CONFIG_S3_REGION=...
-RCLONE_CONFIG_S3_ENDPOINT=...
+RCLONE_DRIVE_CLIENT_ID=...
+RCLONE_DRIVE_CLIENT_SECRET=...
+RCLONE_DRIVE_SCOPE=drive
 ```
 
-If your rclone remote is fully configured elsewhere, you may not need any of these variables.
+You can also enter the client ID and secret directly in the `Backups` dialog.
 
-## 2. Configure app settings
+## 2. Connect Google Drive
 
-Open `Settings` in the app and fill in:
+Open `Backups` in the app. The backup panel and dialog now manage all cloud setup.
 
-- `Cloud Provider`: choose `Google Drive` or `S3 Compatible`. New installs default to `Google Drive`.
-- `rclone Remote Name`: the remote name rclone should use, such as `gdrive` or `s3remote`
-- `Drive Root Folder` or `S3 Bucket`: optional top-level container. Leave it empty for a normal Google Drive remote rooted at My Drive.
-- `Drive Folder Prefix` or `S3 Prefix / Path`: top-level folder used by SaveSync-Bridge inside the selected remote
+- `Drive Remote Name`: the rclone remote name SaveSync-Bridge should manage. The default is `gdrive`.
+- `Drive Folder`: optional top-level folder inside Google Drive. Leave it blank to use the root of `My Drive`.
+- `Backup Library`: the folder path under the selected Drive folder where SaveSync-Bridge stores per-game snapshots.
+- `Google Client ID` and `Google Client Secret`: optional overrides if you made your own OAuth app.
 - `Ludusavi Binary`: optional override; leave empty to use the bundled binary
 - `Rclone Binary`: optional override; leave empty to use the bundled binary
+
+Use these actions in the dialog:
+
+- `Authenticate Google Drive`: opens the browser sign-in flow and saves the refresh token.
+- `Check Connection`: verifies that the saved token and current Drive path work.
+- `Refresh Sign-In`: reruns the OAuth flow if the token expired or was revoked.
+- `Remove Saved Token`: deletes the stored Drive token for the current remote.
 
 The configuration file is stored here:
 
 - Windows: `%APPDATA%/savesync-bridge/config.toml`
 - Linux / Steam Deck: `$XDG_CONFIG_HOME/savesync-bridge/config.toml` or `~/.config/savesync-bridge/config.toml`
+
+The saved Google Drive token lives beside it in:
+
+- Windows: `%APPDATA%/savesync-bridge/rclone.conf`
+- Linux / Steam Deck: `$XDG_CONFIG_HOME/savesync-bridge/rclone.conf` or `~/.config/savesync-bridge/rclone.conf`
 
 ## Daily Workflow
 
@@ -196,15 +207,16 @@ Use it when:
 
 - a game does not appear during refresh
 - credentials or remote path settings are wrong
+- the Google Drive token is missing, expired, or attached to the wrong remote
 - Ludusavi cannot restore or back up a title
 - you need to see the exact CLI behavior
 
 ## Cloud Layout
 
-Within your configured remote path, each game is stored under:
+Within your configured Drive folder and backup library, each game is stored under:
 
 ```text
-<s3_prefix>/<game_id>/
+<backup_path>/<game_id>/
 ```
 
 That folder contains:

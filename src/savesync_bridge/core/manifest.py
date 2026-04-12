@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 
 from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncStatus
 
