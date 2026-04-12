@@ -12,7 +12,7 @@ A PySide6 GUI that acts as a smart manager for [Ludusavi](https://github.com/mtk
 This repository includes GitHub Actions workflows for prepackaged Windows and Linux builds.
 
 - `Cloud Build`: builds Windows and Linux artifacts in GitHub Actions and uploads them as workflow artifacts
-- `Release`: runs on version tags like `v0.1.0` and publishes downloadable release archives for both platforms
+- `Release`: runs automatically on version tags like `v0.1.0` and publishes downloadable release archives for both platforms
 
 Each release archive contains:
 
@@ -29,6 +29,14 @@ To create a GitHub release with both platform builds:
 git tag v0.1.0
 git push origin v0.1.0
 ```
+
+What happens automatically after the tag push:
+
+- GitHub Actions starts the `Release` workflow
+- the workflow builds Windows and Linux binaries in parallel
+- each build bundles the matching platform's Ludusavi and rclone binaries
+- the workflow packages the results into downloadable archives plus SHA-256 checksum files
+- GitHub publishes those archives on the tag's release page
 
 To run an on-demand cloud build without publishing a release, use the `Cloud Build` workflow from the Actions tab.
 

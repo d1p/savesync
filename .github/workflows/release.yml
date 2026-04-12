@@ -4,12 +4,18 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
+    name: Build ${{ matrix.platform }} release bundle
     strategy:
       fail-fast: false
       matrix:
@@ -23,6 +29,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -63,8 +71,10 @@ jobs:
             release/*.sha256
 
   publish:
+    name: Publish GitHub release
     needs: build
     runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
       - name: Download packaged artifacts
@@ -75,6 +85,8 @@ jobs:
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
+          name: SaveSync-Bridge ${{ github.ref_name }}
           files: |
             release-artifacts/**/*.zip
             release-artifacts/**/*.tar.gz
