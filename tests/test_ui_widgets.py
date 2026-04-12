@@ -359,9 +359,9 @@ def test_settings_dialog_get_config_returns_current_values(qtbot, sample_config)
     assert cfg.backup_path == "myprefix"  # unchanged
 
 
-def test_settings_dialog_defaults_to_google_drive(qtbot):
+def test_settings_dialog_defaults_to_google_drive(qtbot, tmp_path: Path):
     """A default config opens with Google Drive defaults and no saved token."""
-    dlg = SettingsDialog(AppConfig())
+    dlg = SettingsDialog(AppConfig(), config_dir=tmp_path)
     qtbot.addWidget(dlg)
 
     assert dlg._drive_remote.text() == "gdrive"
