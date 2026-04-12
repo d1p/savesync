@@ -1,0 +1,28 @@
+# Python / build
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.uv/
+
+# Bundled binaries (fetched by scripts/fetch_bins.py)
+src/savesync_bridge/bin/windows/*.exe
+src/savesync_bridge/bin/linux/ludusavi
+src/savesync_bridge/bin/linux/rclone
+
+# Pytest
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Ruff
+.ruff_cache/
+
+# Credentials — never commit
+.env
+
+# OS
+.DS_Store
+Thumbs.db
