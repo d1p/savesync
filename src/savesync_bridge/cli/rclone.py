@@ -1,35 +1,89 @@
 from __future__ import annotations
 
+import atexit
 import configparser
 import json
 import logging
 import os
 import signal
 import subprocess
+import sys
 from pathlib import Path
 
 from savesync_bridge.core.binaries import resolve_rclone
 from savesync_bridge.core.exceptions import RcloneError
 
+# ---------------------------------------------------------------------------
+# Child-process tracking – kill all rclone children on exit
+# ---------------------------------------------------------------------------
+_active_processes: list[subprocess.Popen] = []  # type: ignore[type-arg]
+
+
+def _cleanup_children() -> None:
+    """Terminate any still-running rclone child processes."""
+    for proc in list(_active_processes):
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        except OSError:
+            pass
+    _active_processes.clear()
+
+
+atexit.register(_cleanup_children)
+
+# On POSIX, also handle SIGTERM so daemon-style kills clean up children.
+if sys.platform != "win32":
+    def _sigterm_handler(signum: int, frame: object) -> None:
+        _cleanup_children()
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
 
 def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:  # type: ignore[type-arg]
-    """Wrapper around subprocess.run that emits on cli_bus (best-effort)."""
+    """Wrapper around subprocess.run that tracks children and emits on cli_bus."""
     try:
         from savesync_bridge.core.cli_bus import cli_bus
         cli_bus.command_run.emit(" ".join(str(c) for c in cmd))
     except Exception:
         pass
-    result = subprocess.run(cmd, **kwargs)
+
+    # Translate capture_output + strip check for Popen compatibility.
+    popen_kwargs = dict(kwargs)
+    popen_kwargs.pop("check", None)
+    if popen_kwargs.pop("capture_output", False):
+        popen_kwargs.setdefault("stdout", subprocess.PIPE)
+        popen_kwargs.setdefault("stderr", subprocess.PIPE)
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    _active_processes.append(proc)
+    try:
+        stdout, stderr = proc.communicate()
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        try:
+            _active_processes.remove(proc)
+        except ValueError:
+            pass
+
+    result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
     try:
         from savesync_bridge.core.cli_bus import cli_bus
-        stdout = result.stdout
-        if stdout:
-            text = stdout.decode("utf-8", errors="replace") if isinstance(stdout, bytes) else stdout
+        if result.stdout:
+            text = result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else result.stdout
             if text.strip():
                 cli_bus.stdout_line.emit(text.strip())
-        stderr = result.stderr
-        if stderr:
-            text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else stderr
+        if result.stderr:
+            text = result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else result.stderr
             if text.strip():
                 cli_bus.stderr_line.emit(text.strip())
         cli_bus.exit_code.emit(result.returncode)
