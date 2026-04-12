@@ -76,8 +76,15 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _print(message: str = "", *, file=None, flush: bool = False) -> None:
+    stream = sys.stdout if file is None else file
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    safe_message = message.encode(encoding, errors="replace").decode(encoding, errors="replace")
+    print(safe_message, file=stream, flush=flush)
+
+
 def _download(url: str) -> bytes:
-    print(f"  Downloading {url} …", flush=True)
+    _print(f"  Downloading {url} ...", flush=True)
     req = urllib.request.Request(url, headers={"User-Agent": "savesync-bridge/fetch_bins"})
     with urllib.request.urlopen(req, timeout=120) as resp:  # noqa: S310 — URL is a hardcoded constant
         return resp.read()
@@ -117,7 +124,7 @@ def _make_executable(path: Path) -> None:
 def fetch(platform: str) -> None:
     entries = MANIFEST.get(platform)
     if entries is None:
-        print(f"Unknown platform {platform!r}. Choose: {list(MANIFEST)}", file=sys.stderr)
+        _print(f"Unknown platform {platform!r}. Choose: {list(MANIFEST)}", file=sys.stderr)
         sys.exit(1)
 
     out_dir = BIN_ROOT / platform
@@ -126,23 +133,23 @@ def fetch(platform: str) -> None:
     for tool, spec in entries.items():
         out_path = out_dir / spec["output_name"]
         if out_path.exists():
-            print(f"  [{platform}/{tool}] already present — skip (delete to re-fetch)")
+            _print(f"  [{platform}/{tool}] already present - skip (delete to re-fetch)")
             continue
 
-        print(f"\n[{platform}/{tool}]")
+        _print(f"\n[{platform}/{tool}]")
         archive_bytes = _download(spec["url"])
 
         actual = _sha256(archive_bytes)
         expected = spec["sha256"]
         if actual != expected:
-            print(
+            _print(
                 f"  SHA-256 MISMATCH for {spec['url']}\n"
                 f"    expected: {expected}\n"
                 f"    got:      {actual}",
                 file=sys.stderr,
             )
             sys.exit(1)
-        print(f"  SHA-256 verified ✓")
+        _print("  SHA-256 verified")
 
         if spec["archive_type"] == "zip":
             binary_bytes = _extract_from_zip(archive_bytes, spec["binary_name"])
@@ -152,7 +159,7 @@ def fetch(platform: str) -> None:
         out_path.write_bytes(binary_bytes)
         _make_executable(out_path)
         size_mb = out_path.stat().st_size / 1_048_576
-        print(f"  Written → {out_path.relative_to(BIN_ROOT.parent.parent.parent)} ({size_mb:.1f} MB)")
+        _print(f"  Written -> {out_path.relative_to(BIN_ROOT.parent.parent.parent)} ({size_mb:.1f} MB)")
 
 
 # ---------------------------------------------------------------------------
@@ -183,10 +190,10 @@ def main() -> None:
         platforms = ["windows" if sys.platform == "win32" else "linux"]
 
     for platform in platforms:
-        print(f"\n=== {platform} ===")
+        _print(f"\n=== {platform} ===")
         fetch(platform)
 
-    print("\nDone.")
+    _print("\nDone.")
 
 
 if __name__ == "__main__":
