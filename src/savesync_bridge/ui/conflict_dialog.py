@@ -94,9 +94,12 @@ class ConflictDialog(QDialog):
 
         keep_local_btn = QPushButton("Keep Mine")
         keep_local_btn.setObjectName("accent_btn")
+        keep_local_btn.setToolTip("Upload your local save to the cloud, overwriting the cloud version")
 
         keep_cloud_btn = QPushButton("Keep Cloud")
+        keep_cloud_btn.setToolTip("Download the cloud save and overwrite your local files")
         cancel_btn = QPushButton("Cancel (Do Nothing)")
+        cancel_btn.setToolTip("Leave both saves unchanged and resolve later")
 
         keep_local_btn.clicked.connect(self._on_keep_local)
         keep_cloud_btn.clicked.connect(self._on_keep_cloud)

@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QSizePolicy,
@@ -92,10 +93,14 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
 
         self._refresh_action = toolbar.addAction("\u21bb  Refresh")
+        self._refresh_action.setToolTip("Re-scan local games with Ludusavi")
         self._push_all_action = toolbar.addAction("\u2b06  Push All")
+        self._push_all_action.setToolTip("Upload all local saves to Google Drive")
         self._pull_all_action = toolbar.addAction("\u2b07  Pull All")
+        self._pull_all_action.setToolTip("Download all cloud saves and restore them locally")
         toolbar.addSeparator()
         self._settings_action = toolbar.addAction("\u2601  Backups")
+        self._settings_action.setToolTip("Open Google Drive and backup settings")
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -177,16 +182,17 @@ class MainWindow(QMainWindow):
         sidebar_layout.addSpacing(6)
 
         self._filter_btns: list[tuple[SyncStatus | None, QPushButton]] = []
-        for label, status in [
-            ("\u25cf  All Games", None),
-            ("\u25cf  Local Newer", SyncStatus.LOCAL_NEWER),
-            ("\u25cf  Conflicts", SyncStatus.CONFLICT),
-            ("\u25cf  Synced", SyncStatus.SYNCED),
+        for label, status, tip in [
+            ("\u25cf  All Games", None, "Show all discovered games"),
+            ("\u25cf  Local Newer", SyncStatus.LOCAL_NEWER, "Show games whose local save is newer than the cloud"),
+            ("\u25cf  Conflicts", SyncStatus.CONFLICT, "Show games with conflicting local and cloud saves"),
+            ("\u25cf  Synced", SyncStatus.SYNCED, "Show games that are in sync with the cloud"),
         ]:
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setFlat(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(tip)
             btn.setStyleSheet(
                 "text-align: left; padding: 7px 10px; border-radius: 6px; font-size: 10pt;"
             )
@@ -238,6 +244,7 @@ class MainWindow(QMainWindow):
         manage_backups_btn = QPushButton("Manage Backups")
         manage_backups_btn.setObjectName("accent_btn")
         manage_backups_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        manage_backups_btn.setToolTip("Open Google Drive and backup settings")
         manage_backups_btn.clicked.connect(self._on_settings)
         backup_layout.addWidget(manage_backups_btn)
 
@@ -435,6 +442,18 @@ class MainWindow(QMainWindow):
         game = self._games.get(game_id)
         wine_prefix = game.wine_prefix if game else None
         wine_user = game.wine_user if game else None
+        if self._local_is_newer(game_id, manifest):
+            answer = QMessageBox.question(
+                self,
+                "Overwrite newer local save?",
+                f"Your local save for \u201c{game_id}\u201d is newer than the cloud version.\n\n"
+                "Pulling will overwrite it. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._set_status("Pull cancelled")
+                return
         self._start_pull_batch([
             (game_id, manifest, wine_prefix, wine_user),
         ])
@@ -489,6 +508,30 @@ class MainWindow(QMainWindow):
         if not specs:
             self._set_status("No cloud saves found")
             return
+        # Filter out specs where local save is newer — ask once for all of them.
+        newer_local = [
+            gid for gid, cloud_m, *_ in specs
+            if self._local_is_newer(gid, cloud_m)
+        ]
+        if newer_local:
+            names = ", ".join(newer_local[:5])
+            suffix = f" and {len(newer_local) - 5} more" if len(newer_local) > 5 else ""
+            answer = QMessageBox.question(
+                self,
+                "Overwrite newer local saves?",
+                f"{len(newer_local)} game(s) have a local save newer than the cloud version:\n"
+                f"{names}{suffix}\n\n"
+                "Include them in the pull (overwriting local), or skip them?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                specs = [
+                    s for s in specs if s[0] not in newer_local
+                ]
+                if not specs:
+                    self._set_status("Pull cancelled — all games had newer local saves")
+                    return
         self._start_pull_batch(specs)
 
     def _on_game_updated(self, game_id: str, result: SyncResult) -> None:
@@ -550,6 +593,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _local_is_newer(self, game_id: str, cloud_manifest: GameManifest) -> bool:
+        """Return True if the local manifest is newer than *cloud_manifest*."""
+        local = self._engine.get_local_manifest(game_id)
+        if local is None:
+            return False
+        return local.timestamp > cloud_manifest.timestamp
 
     def _restore_cached_games(self) -> None:
         """Load previously-discovered games from disk so the UI is not empty."""

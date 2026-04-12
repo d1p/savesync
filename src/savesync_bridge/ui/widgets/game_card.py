@@ -118,10 +118,13 @@ class GameCard(QFrame):
 
         self._push_btn = QPushButton("\u2b06 Push")
         self._push_btn.setObjectName("push_btn")
+        self._push_btn.setToolTip("Upload this game's local save to Google Drive")
         self._pull_btn = QPushButton("\u2b07 Pull")
         self._pull_btn.setObjectName("pull_btn")
+        self._pull_btn.setToolTip("Download this game's cloud save and restore it locally")
         self._details_btn = QPushButton("\u2261 Sync")
         self._details_btn.setObjectName("details_btn")
+        self._details_btn.setToolTip("Smart sync: push, pull, or show conflict dialog as needed")
 
         for btn in (self._push_btn, self._pull_btn, self._details_btn):
             btn.setFixedHeight(30)

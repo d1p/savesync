@@ -98,18 +98,22 @@ class SettingsDialog(QDialog):
 
         self._auth_btn = QPushButton("Authenticate Google Drive")
         self._auth_btn.setObjectName("accent_btn")
+        self._auth_btn.setToolTip("Open the Google sign-in flow in your browser to authorise rclone")
         self._auth_btn.clicked.connect(lambda: self._start_drive_action("authenticate"))
         action_row.addWidget(self._auth_btn)
 
         self._verify_btn = QPushButton("Check Connection")
+        self._verify_btn.setToolTip("Test that the saved token can still list files on Google Drive")
         self._verify_btn.clicked.connect(lambda: self._start_drive_action("verify"))
         action_row.addWidget(self._verify_btn)
 
         self._reconnect_btn = QPushButton("Refresh Sign-In")
+        self._reconnect_btn.setToolTip("Re-run the Google sign-in flow to refresh an expired token")
         self._reconnect_btn.clicked.connect(lambda: self._start_drive_action("reconnect"))
         action_row.addWidget(self._reconnect_btn)
 
         self._disconnect_btn = QPushButton("Remove Saved Token")
+        self._disconnect_btn.setToolTip("Delete the saved Google Drive token from rclone config")
         self._disconnect_btn.clicked.connect(lambda: self._start_drive_action("disconnect"))
         action_row.addWidget(self._disconnect_btn)
 
