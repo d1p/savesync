@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 
 from savesync_bridge.cli.ludusavi import LudusaviGame
 from savesync_bridge.core.config import AppConfig, save_config
+from savesync_bridge.core.path_translator import extract_wine_prefix_metadata
 from savesync_bridge.core.sync_engine import SyncEngine, SyncResult
 from savesync_bridge.models.game import Game, GameManifest, SyncStatus
 from savesync_bridge.ui.conflict_dialog import ConflictDialog
@@ -25,9 +26,13 @@ from savesync_bridge.ui.workers import PullWorker, PushWorker, ScanWorker, SyncW
 
 
 def _ludusavi_to_game(lg: LudusaviGame) -> Game:
+    steam_app_id, wine_prefix, wine_user = extract_wine_prefix_metadata(lg.save_paths)
     return Game(
         id=lg.name,
         name=lg.name,
+        steam_app_id=steam_app_id,
+        wine_prefix=wine_prefix,
+        wine_user=wine_user,
         save_paths=tuple(lg.save_paths),
     )
 
@@ -70,16 +75,14 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(spacer)
 
         self._status_label = QLabel("Ready")
-        self._status_label.setStyleSheet(
-            "padding: 0 10px; color: #6c7086; font-size: 10pt;"
-        )
+        self._status_label.setStyleSheet("padding: 0 10px; color: #6c7086; font-size: 10pt;")
         toolbar.addWidget(self._status_label)
 
     def _build_central(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
 
-        from PySide6.QtWidgets import QSplitter  # noqa: PLC0415
+        from PySide6.QtWidgets import QSplitter
 
         central_layout = QVBoxLayout(central)
         central_layout.setContentsMargins(0, 0, 0, 0)
@@ -175,11 +178,12 @@ class MainWindow(QMainWindow):
         # Wire CLI subprocess events to the debug panel
         try:
             from savesync_bridge.core.cli_bus import cli_bus
+
             cli_bus.command_run.connect(self._debug.log_command)
             cli_bus.stdout_line.connect(self._debug.log_stdout)
             cli_bus.stderr_line.connect(self._debug.log_stderr)
             cli_bus.exit_code.connect(self._debug.log_exit)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     # ------------------------------------------------------------------
@@ -229,7 +233,8 @@ class MainWindow(QMainWindow):
                 self._start_pull(game_id, cloud)
 
     def _on_settings(self) -> None:
-        from PySide6.QtWidgets import QDialog  # noqa: PLC0415
+        from PySide6.QtWidgets import QDialog
+
         dlg = SettingsDialog(self._config, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._config = dlg.get_config()
@@ -261,7 +266,17 @@ class MainWindow(QMainWindow):
     def _on_details_game(self, game_id: str) -> None:
         """Trigger a smart sync for the game; shows conflict dialog if needed."""
         self._set_status(f"Checking sync status for {game_id}…")
-        worker = SyncWorker(self._engine, [game_id], parent=self)
+        worker = SyncWorker(
+            self._engine,
+            [game_id],
+            target_wine_contexts={
+                game_id: (
+                    self._games[game_id].wine_prefix,
+                    self._games[game_id].wine_user,
+                )
+            },
+            parent=self,
+        )
         worker.game_updated.connect(self._on_game_updated)
         worker.conflict_detected.connect(self._on_conflict_detected)
         worker.finished.connect(lambda: self._set_status("Status check complete"))
@@ -274,7 +289,16 @@ class MainWindow(QMainWindow):
 
     def _start_pull(self, game_id: str, manifest: GameManifest) -> None:
         self._set_status(f"Pulling {game_id}…")
-        worker = PullWorker(self._engine, game_id, manifest, parent=self)
+        wine_prefix = self._games.get(game_id).wine_prefix if game_id in self._games else None
+        wine_user = self._games.get(game_id).wine_user if game_id in self._games else None
+        worker = PullWorker(
+            self._engine,
+            game_id,
+            manifest,
+            target_wine_prefix=wine_prefix,
+            target_wine_user=wine_user,
+            parent=self,
+        )
         worker.finished.connect(self._on_pull_done)
         worker.error.connect(self._on_worker_error)
         worker.start()
@@ -291,6 +315,8 @@ class MainWindow(QMainWindow):
             id=old.id,
             name=old.name,
             steam_app_id=old.steam_app_id,
+            wine_prefix=old.wine_prefix,
+            wine_user=old.wine_user,
             save_paths=old.save_paths,
             status=result.status,
             local_manifest=old.local_manifest,

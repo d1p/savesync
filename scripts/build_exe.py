@@ -3,7 +3,6 @@
 Usage:
     uv run build-exe            # standard release build
     uv run build-exe --debug    # keep console window for debugging
-    uv run build-exe --dir      # one-folder build (faster startup, easier debugging)
 """
 
 from __future__ import annotations
@@ -26,12 +25,6 @@ def main() -> int:
         "--debug",
         action="store_true",
         help="Enable console window and debug mode",
-    )
-    parser.add_argument(
-        "--dir",
-        action="store_true",
-        dest="onedir",
-        help="Produce a one-folder build instead of a single-file EXE",
     )
     parser.add_argument(
         "--clean",
@@ -57,11 +50,6 @@ def main() -> int:
         "--distpath", str(DIST),
     ]
 
-    if args.onedir:
-        cmd.append("--onedir")
-    else:
-        cmd.append("--onefile")
-
     if args.debug:
         cmd += ["--debug", "all", "--console"]
 
@@ -74,7 +62,6 @@ def main() -> int:
             size_mb = exe_path.stat().st_size / 1_048_576
             print(f"\nBuild successful: {exe_path}  ({size_mb:.1f} MB)")
         else:
-            # one-dir build
             print(f"\nBuild successful — output in {DIST}/")
     else:
         print("\nBuild FAILED", file=sys.stderr)

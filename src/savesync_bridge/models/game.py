@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
@@ -40,6 +40,8 @@ class Game:
     id: str
     name: str
     steam_app_id: str | None = None
+    wine_prefix: str | None = None
+    wine_user: str | None = None
     save_paths: tuple[str, ...] = ()
     status: SyncStatus = SyncStatus.UNKNOWN
     local_manifest: GameManifest | None = None

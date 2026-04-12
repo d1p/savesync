@@ -103,8 +103,9 @@ Sequence:
 1. Create a temporary staging directory.
 2. Create a per-game subdirectory.
 3. Download the cloud snapshot into that directory using rclone.
-4. Run Ludusavi restore for that game from the staging directory.
-5. Save the cloud manifest into the local state cache.
+4. If the snapshot came from Windows and the current machine uses a Wine or Proton prefix, or vice versa, rewrite the staged Ludusavi backup layout and `mapping.yaml` to the target environment's absolute paths.
+5. Run Ludusavi restore for that game from the rewritten staging directory.
+6. Save the cloud manifest into the local state cache.
 
 Flow:
 
@@ -132,7 +133,9 @@ The current implementation does not resolve replacement at file granularity.
 What actually happens:
 
 - `push()` uploads a full staged snapshot for a game
-- `pull()` restores a full staged snapshot for a game
+- `pull()` restores a full staged snapshot for a game, rewriting Windows and Wine-prefix absolute paths first when the host environments differ
+
+Cross-platform path rewriting now applies to any Linux save path that Ludusavi reports inside a Wine-style `.../drive_c` prefix. That includes Steam compatdata prefixes and non-Steam launchers such as Heroic or Lutris when their saves live inside a Wine prefix.
 - conflict resolution chooses one of those two operations
 
 What does not happen:

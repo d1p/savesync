@@ -111,7 +111,10 @@ Important behavior:
 
 - Pull is also whole-game, not per-file.
 - SaveSync-Bridge does not choose individual files to restore.
-- Ludusavi performs the actual restore step and applies the downloaded backup to the machine.
+- When a snapshot moves between Windows and a Wine or Proton prefix, SaveSync-Bridge rewrites the downloaded Ludusavi backup to the current machine's absolute-path layout before restore.
+- Ludusavi then performs the actual restore step and applies the rewritten backup to the machine.
+
+This works for Steam games and for non-Steam titles as long as Ludusavi discovers their Linux save path inside a Wine-style prefix ending in `drive_c`.
 
 ## How The App Decides Which Side Wins
 
@@ -223,7 +226,7 @@ These files are not the actual saves. They are metadata snapshots used for sync 
 
 - Sync decisions are based on manifests, not live comparison of both machines at the same time.
 - The app currently resolves at the game level, not the file level.
-- Path translation utilities exist in the codebase for Windows and Proton paths, but the current sync engine relies on Ludusavi backup and restore rather than rewriting save paths itself.
+- Cross-environment conversion is currently implemented for Windows and Wine-prefix saves, including non-Steam launchers when Ludusavi reports paths under `drive_c`. Native Linux save layouts that do not live inside a Wine prefix are not remapped to Windows.
 
 ## Build And Run
 

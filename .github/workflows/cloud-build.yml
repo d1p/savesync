@@ -1,0 +1,70 @@
+name: Cloud Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/cloud-build.yml
+      - pyproject.toml
+      - savesync_bridge.spec
+      - scripts/**
+      - src/**
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-24.04
+            platform: linux
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libdbus-1-3 libxcb-cursor0
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Fetch bundled binaries
+        run: uv run python scripts/fetch_bins.py --platform ${{ matrix.platform }}
+
+      - name: Build packaged app
+        run: uv run build-exe
+
+      - name: Package release archive
+        run: >-
+          uv run package-release
+          --version ${{ github.ref_name == 'main' && format('main-{0}', github.sha) || github.ref_name }}
+          --platform ${{ matrix.platform }}
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: savesync-bridge-${{ matrix.platform }}-${{ github.run_number }}
+          path: |
+            release/*.zip
+            release/*.tar.gz
+            release/*.sha256

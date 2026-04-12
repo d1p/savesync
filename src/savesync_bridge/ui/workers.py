@@ -21,7 +21,7 @@ class ScanWorker(QThread):
         try:
             games: list[LudusaviGame] = list_games(binary=self._engine._ludusavi_bin)
             self.games_ready.emit(games)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.error.emit(str(exc))
 
 
@@ -40,23 +40,33 @@ class SyncWorker(QThread):
         self,
         engine: SyncEngine,
         game_ids: list[str],
+        target_wine_contexts: dict[str, tuple[str | None, str | None]] | None = None,
         parent: object = None,
     ) -> None:
         super().__init__(parent)
         self._engine = engine
         self._game_ids = list(game_ids)
+        self._target_wine_contexts = target_wine_contexts or {}
 
     def run(self) -> None:
         try:
             for game_id in self._game_ids:
-                result: SyncResult = self._engine.sync(game_id)
+                target_wine_prefix, target_wine_user = self._target_wine_contexts.get(
+                    game_id,
+                    (None, None),
+                )
+                result: SyncResult = self._engine.sync(
+                    game_id,
+                    target_wine_prefix=target_wine_prefix,
+                    target_wine_user=target_wine_user,
+                )
                 if result.status == SyncStatus.CONFLICT:
                     local = self._engine._get_local_manifest(game_id)
                     cloud = self._engine.get_cloud_manifest(game_id)
                     self.conflict_detected.emit(game_id, local, cloud)
                 else:
                     self.game_updated.emit(game_id, result)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.error.emit(str(exc))
         finally:
             self.finished.emit()
@@ -84,7 +94,7 @@ class PushWorker(QThread):
             for game_id in self._game_ids:
                 result: SyncResult = self._engine.push(game_id)
                 self.game_updated.emit(game_id, result)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.error.emit(str(exc))
         finally:
             self.finished.emit()
@@ -101,16 +111,25 @@ class PullWorker(QThread):
         engine: SyncEngine,
         game_id: str,
         manifest: GameManifest,
+        target_wine_prefix: str | None = None,
+        target_wine_user: str | None = None,
         parent: object = None,
     ) -> None:
         super().__init__(parent)
         self._engine = engine
         self._game_id = game_id
         self._manifest = manifest
+        self._target_wine_prefix = target_wine_prefix
+        self._target_wine_user = target_wine_user
 
     def run(self) -> None:
         try:
-            result: SyncResult = self._engine.pull(self._game_id, self._manifest)
+            result: SyncResult = self._engine.pull(
+                self._game_id,
+                self._manifest,
+                target_wine_prefix=self._target_wine_prefix,
+                target_wine_user=self._target_wine_user,
+            )
             self.finished.emit(self._game_id, result)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self.error.emit(str(exc))

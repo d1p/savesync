@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from savesync_bridge.core.path_translator import translate_save_path, windows_env_to_proton
+from savesync_bridge.core.path_translator import (
+    extract_wine_prefix_metadata,
+    proton_absolute_to_windows,
+    translate_save_path,
+    windows_absolute_to_proton,
+    windows_absolute_to_wine_prefix,
+    windows_env_to_proton,
+    wine_prefix_absolute_to_windows,
+)
 from savesync_bridge.models.game import Platform
 
 # Base Proton path template for assertions
@@ -137,3 +145,68 @@ def test_translate_steam_deck_to_windows_local_appdata() -> None:
     proton_path = _compat(APP_ID) + "/users/steamuser/AppData/Local/Game/save.dat"
     result = translate_save_path(proton_path, Platform.STEAM_DECK, Platform.WINDOWS)
     assert result == "%LOCALAPPDATA%/Game/save.dat"
+
+
+def test_extract_wine_prefix_metadata_for_steam() -> None:
+    app_id, prefix, wine_user = extract_wine_prefix_metadata(
+        [
+            "/home/deck/.local/share/Steam/steamapps/compatdata/1145360/pfx/drive_c/users/steamuser/AppData/Roaming/Hades",
+        ]
+    )
+    assert app_id == "1145360"
+    assert prefix == ("/home/deck/.local/share/Steam/steamapps/compatdata/1145360/pfx/drive_c")
+    assert wine_user == "steamuser"
+
+
+def test_extract_wine_prefix_metadata_for_non_steam_prefix() -> None:
+    app_id, prefix, wine_user = extract_wine_prefix_metadata(
+        [
+            "/home/deck/Games/heroic/Hades/prefix/drive_c/users/deck/AppData/Local/Hades/Profile1.sav",
+        ]
+    )
+    assert app_id is None
+    assert prefix == "/home/deck/Games/heroic/Hades/prefix/drive_c"
+    assert wine_user == "deck"
+
+
+def test_windows_absolute_to_proton() -> None:
+    proton_prefix = _compat(APP_ID)
+    path = "C:/Users/Player/AppData/Roaming/Hades/Profile1.sav"
+    result = windows_absolute_to_proton(path, proton_prefix)
+    assert result == f"{proton_prefix}/users/steamuser/AppData/Roaming/Hades/Profile1.sav"
+
+
+def test_windows_absolute_to_wine_prefix_non_steam_user() -> None:
+    wine_prefix = "/home/deck/Games/heroic/Hades/prefix/drive_c"
+    path = "C:/Users/Player/AppData/Roaming/Hades/Profile1.sav"
+    result = windows_absolute_to_wine_prefix(path, wine_prefix, wine_user="deck")
+    assert result == f"{wine_prefix}/users/deck/AppData/Roaming/Hades/Profile1.sav"
+
+
+def test_proton_absolute_to_windows() -> None:
+    proton_path = _compat(APP_ID) + "/users/steamuser/AppData/Local/Hades/Profile1.sav"
+    result = proton_absolute_to_windows(
+        proton_path,
+        env={
+            "USERPROFILE": "C:/Users/Alice",
+            "APPDATA": "C:/Users/Alice/AppData/Roaming",
+            "LOCALAPPDATA": "C:/Users/Alice/AppData/Local",
+        },
+    )
+    assert result == "C:/Users/Alice/AppData/Local/Hades/Profile1.sav"
+
+
+def test_wine_prefix_absolute_to_windows_non_steam() -> None:
+    wine_path = (
+        "/home/deck/Games/heroic/Hades/prefix/drive_c/"
+        "users/deck/AppData/Roaming/Hades/Profile1.sav"
+    )
+    result = wine_prefix_absolute_to_windows(
+        wine_path,
+        env={
+            "USERPROFILE": "C:/Users/Alice",
+            "APPDATA": "C:/Users/Alice/AppData/Roaming",
+            "LOCALAPPDATA": "C:/Users/Alice/AppData/Local",
+        },
+    )
+    assert result == "C:/Users/Alice/AppData/Roaming/Hades/Profile1.sav"

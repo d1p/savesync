@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -30,7 +30,7 @@ def _make_manifest(
     content_hash: str = "sha256:abc123",
 ) -> GameManifest:
     if ts is None:
-        ts = datetime(2026, 4, 12, 10, 0, 0, tzinfo=timezone.utc)
+        ts = datetime(2026, 4, 12, 10, 0, 0, tzinfo=UTC)
     return GameManifest(
         game_id=game_id,
         host=host,
@@ -40,7 +40,7 @@ def _make_manifest(
             SaveFile(
                 path="Profile1.sav",
                 size=1024,
-                modified=datetime(2026, 4, 12, 9, 0, 0, tzinfo=timezone.utc),
+                modified=datetime(2026, 4, 12, 9, 0, 0, tzinfo=UTC),
             ),
         ),
     )
@@ -101,7 +101,7 @@ class TestPush:
     def test_success_returns_synced(self, engine: SyncEngine) -> None:
         with (
             patch("savesync_bridge.core.sync_engine.ludusavi") as mock_lud,
-            patch("savesync_bridge.core.sync_engine.rclone") as mock_rcl,
+            patch("savesync_bridge.core.sync_engine.rclone"),
         ):
             mock_lud.backup_game.return_value = Path("/tmp/staging/Hades")
             result = engine.push(GAME_ID)
@@ -200,6 +200,26 @@ class TestPull:
         mock_lud.restore_game.assert_called_once()
         assert mock_lud.restore_game.call_args[0][0] == GAME_ID
 
+    def test_converts_backup_before_restore(self, engine: SyncEngine) -> None:
+        m = _make_manifest(host=Platform.WINDOWS)
+        wine_prefix = "/home/deck/Games/heroic/Hades/prefix/drive_c"
+        with (
+            patch("savesync_bridge.core.sync_engine.ludusavi"),
+            patch("savesync_bridge.core.sync_engine.rclone"),
+            patch(
+                "savesync_bridge.core.sync_engine.convert_simple_backup_for_restore"
+            ) as mock_convert,
+        ):
+            engine.pull(
+                GAME_ID,
+                m,
+                target_wine_prefix=wine_prefix,
+                target_wine_user="deck",
+            )
+        mock_convert.assert_called_once()
+        assert mock_convert.call_args.kwargs["target_wine_prefix"] == wine_prefix
+        assert mock_convert.call_args.kwargs["target_wine_user"] == "deck"
+
     def test_saves_cloud_manifest_as_local_after_pull(
         self, engine: SyncEngine, tmp_path: Path
     ) -> None:
@@ -274,9 +294,9 @@ class TestCheckStatus:
         assert result.status == SyncStatus.UNKNOWN
 
     def test_local_newer_status_from_manifest_compare(self, engine: SyncEngine) -> None:
-        local = _make_manifest(ts=datetime(2026, 4, 12, 12, 0, 0, tzinfo=timezone.utc))
+        local = _make_manifest(ts=datetime(2026, 4, 12, 12, 0, 0, tzinfo=UTC))
         cloud = _make_manifest(
-            ts=datetime(2026, 4, 12, 10, 0, 0, tzinfo=timezone.utc),
+            ts=datetime(2026, 4, 12, 10, 0, 0, tzinfo=UTC),
             content_hash="sha256:different",
         )
         self._write_local(engine, local)
@@ -286,11 +306,11 @@ class TestCheckStatus:
 
     def test_cloud_newer_status_from_manifest_compare(self, engine: SyncEngine) -> None:
         local = _make_manifest(
-            ts=datetime(2026, 4, 12, 8, 0, 0, tzinfo=timezone.utc),
+            ts=datetime(2026, 4, 12, 8, 0, 0, tzinfo=UTC),
             content_hash="sha256:old",
         )
         cloud = _make_manifest(
-            ts=datetime(2026, 4, 12, 12, 0, 0, tzinfo=timezone.utc),
+            ts=datetime(2026, 4, 12, 12, 0, 0, tzinfo=UTC),
             content_hash="sha256:new",
         )
         self._write_local(engine, local)
@@ -306,9 +326,11 @@ class TestCheckStatus:
 
 class TestSync:
     def test_pushes_when_local_newer(self, engine: SyncEngine) -> None:
+        local_newer = SyncResult(GAME_ID, SyncStatus.LOCAL_NEWER)
+        synced = SyncResult(GAME_ID, SyncStatus.SYNCED)
         with (
-            patch.object(engine, "check_status", return_value=SyncResult(GAME_ID, SyncStatus.LOCAL_NEWER)),
-            patch.object(engine, "push", return_value=SyncResult(GAME_ID, SyncStatus.SYNCED)) as mock_push,
+            patch.object(engine, "check_status", return_value=local_newer),
+            patch.object(engine, "push", return_value=synced) as mock_push,
         ):
             result = engine.sync(GAME_ID)
         mock_push.assert_called_once_with(GAME_ID)
@@ -316,23 +338,36 @@ class TestSync:
 
     def test_pulls_when_cloud_newer(self, engine: SyncEngine) -> None:
         m = _make_manifest()
+        cloud_newer = SyncResult(GAME_ID, SyncStatus.CLOUD_NEWER)
+        synced = SyncResult(GAME_ID, SyncStatus.SYNCED)
         with (
-            patch.object(engine, "check_status", return_value=SyncResult(GAME_ID, SyncStatus.CLOUD_NEWER)),
+            patch.object(engine, "check_status", return_value=cloud_newer),
             patch.object(engine, "get_cloud_manifest", return_value=m),
-            patch.object(engine, "pull", return_value=SyncResult(GAME_ID, SyncStatus.SYNCED)) as mock_pull,
+            patch.object(engine, "pull", return_value=synced) as mock_pull,
         ):
-            result = engine.sync(GAME_ID)
-        mock_pull.assert_called_once_with(GAME_ID, m)
+            result = engine.sync(
+                GAME_ID,
+                target_wine_prefix="/home/deck/Games/heroic/Hades/prefix/drive_c",
+                target_wine_user="deck",
+            )
+        mock_pull.assert_called_once_with(
+            GAME_ID,
+            m,
+            target_wine_prefix="/home/deck/Games/heroic/Hades/prefix/drive_c",
+            target_wine_user="deck",
+        )
         assert result.status == SyncStatus.SYNCED
 
     def test_returns_conflict_when_conflict(self, engine: SyncEngine) -> None:
-        with patch.object(engine, "check_status", return_value=SyncResult(GAME_ID, SyncStatus.CONFLICT)):
+        conflict = SyncResult(GAME_ID, SyncStatus.CONFLICT)
+        with patch.object(engine, "check_status", return_value=conflict):
             result = engine.sync(GAME_ID)
         assert result.status == SyncStatus.CONFLICT
 
     def test_no_op_when_already_synced(self, engine: SyncEngine) -> None:
+        synced = SyncResult(GAME_ID, SyncStatus.SYNCED)
         with (
-            patch.object(engine, "check_status", return_value=SyncResult(GAME_ID, SyncStatus.SYNCED)),
+            patch.object(engine, "check_status", return_value=synced),
             patch.object(engine, "push") as mock_push,
             patch.object(engine, "pull") as mock_pull,
         ):
@@ -342,19 +377,20 @@ class TestSync:
         assert result.status == SyncStatus.SYNCED
 
     def test_error_propagation_from_push(self, engine: SyncEngine) -> None:
+        local_newer = SyncResult(GAME_ID, SyncStatus.LOCAL_NEWER)
+        unknown = SyncResult(GAME_ID, SyncStatus.UNKNOWN, error="oops")
         with (
-            patch.object(engine, "check_status", return_value=SyncResult(GAME_ID, SyncStatus.LOCAL_NEWER)),
-            patch.object(engine, "push", return_value=SyncResult(GAME_ID, SyncStatus.UNKNOWN, error="oops")),
+            patch.object(engine, "check_status", return_value=local_newer),
+            patch.object(engine, "push", return_value=unknown),
         ):
             result = engine.sync(GAME_ID)
         assert result.status == SyncStatus.UNKNOWN
         assert result.error == "oops"
 
-    def test_returns_unknown_when_cloud_manifest_missing_on_pull(
-        self, engine: SyncEngine
-    ) -> None:
+    def test_returns_unknown_when_cloud_manifest_missing_on_pull(self, engine: SyncEngine) -> None:
+        cloud_newer = SyncResult(GAME_ID, SyncStatus.CLOUD_NEWER)
         with (
-            patch.object(engine, "check_status", return_value=SyncResult(GAME_ID, SyncStatus.CLOUD_NEWER)),
+            patch.object(engine, "check_status", return_value=cloud_newer),
             patch.object(engine, "get_cloud_manifest", return_value=None),
         ):
             result = engine.sync(GAME_ID)

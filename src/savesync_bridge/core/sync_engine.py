@@ -6,11 +6,12 @@ import os
 import sys
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from savesync_bridge.cli import ludusavi, rclone
 from savesync_bridge.core import manifest as manifest_module
+from savesync_bridge.core.backup_converter import convert_simple_backup_for_restore
 from savesync_bridge.core.config import AppConfig
 from savesync_bridge.core.exceptions import LudusaviError, RcloneError, SyncError
 from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncStatus
@@ -41,7 +42,7 @@ def _build_manifest(game_id: str, game_dir: Path) -> GameManifest:
             continue
         data = f.read_bytes()
         hasher.update(data)
-        modified = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
+        modified = datetime.fromtimestamp(f.stat().st_mtime, tz=UTC)
         save_files.append(
             SaveFile(
                 path=str(f.relative_to(game_dir)),
@@ -54,7 +55,7 @@ def _build_manifest(game_id: str, game_dir: Path) -> GameManifest:
     return GameManifest(
         game_id=game_id,
         host=host,
-        timestamp=datetime.now(tz=timezone.utc),
+        timestamp=datetime.now(tz=UTC),
         hash=f"sha256:{hasher.hexdigest()}",
         files=tuple(save_files),
     )
@@ -103,6 +104,19 @@ class SyncEngine:
         self._local_manifest_path(m.game_id).write_text(
             manifest_module.to_json(m), encoding="utf-8"
         )
+
+    def _restore_platform(self, target_wine_prefix: str | None) -> Platform:
+        if sys.platform == "win32":
+            return Platform.WINDOWS
+        if target_wine_prefix:
+            return Platform.STEAM_DECK
+        return Platform.LINUX
+
+    def _conversion_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        if self._env is not None:
+            env.update(self._env)
+        return env
 
     # ------------------------------------------------------------------
     # Public API
@@ -185,7 +199,13 @@ class SyncEngine:
         except (LudusaviError, RcloneError, SyncError) as exc:
             return SyncResult(game_id=game_id, status=SyncStatus.UNKNOWN, error=str(exc))
 
-    def pull(self, game_id: str, manifest: GameManifest) -> SyncResult:
+    def pull(
+        self,
+        game_id: str,
+        manifest: GameManifest,
+        target_wine_prefix: str | None = None,
+        target_wine_user: str | None = None,
+    ) -> SyncResult:
         """Download saves from S3 and restore them via Ludusavi.
 
         Args:
@@ -211,6 +231,15 @@ class SyncEngine:
                     game_dir,
                     env=self._env,
                     binary=self._rclone_bin,
+                )
+
+                convert_simple_backup_for_restore(
+                    game_dir,
+                    manifest.host,
+                    self._restore_platform(target_wine_prefix),
+                    target_wine_prefix=target_wine_prefix,
+                    target_wine_user=target_wine_user,
+                    env=self._conversion_env(),
                 )
 
                 # 2. Restore via Ludusavi
@@ -249,7 +278,12 @@ class SyncEngine:
         status = manifest_module.compare(local, cloud)
         return SyncResult(game_id=game_id, status=status)
 
-    def sync(self, game_id: str) -> SyncResult:
+    def sync(
+        self,
+        game_id: str,
+        target_wine_prefix: str | None = None,
+        target_wine_user: str | None = None,
+    ) -> SyncResult:
         """Smart sync: push, pull, or report conflict based on manifest comparison.
 
         Returns ``CONFLICT`` if both local and cloud are independently modified —
@@ -280,6 +314,11 @@ class SyncEngine:
                     status=SyncStatus.UNKNOWN,
                     error="Cloud manifest vanished during sync",
                 )
-            return self.pull(game_id, cloud)
+            return self.pull(
+                game_id,
+                cloud,
+                target_wine_prefix=target_wine_prefix,
+                target_wine_user=target_wine_user,
+            )
 
         return status_result

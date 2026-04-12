@@ -7,9 +7,34 @@ A PySide6 GUI that acts as a smart manager for [Ludusavi](https://github.com/mtk
 - User guide: [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 - Technical documentation: [docs/TECHNICAL.md](docs/TECHNICAL.md)
 
+## Cloud Builds And Releases
+
+This repository includes GitHub Actions workflows for prepackaged Windows and Linux builds.
+
+- `Cloud Build`: builds Windows and Linux artifacts in GitHub Actions and uploads them as workflow artifacts
+- `Release`: runs on version tags like `v0.1.0` and publishes downloadable release archives for both platforms
+
+Each release archive contains:
+
+- the packaged SaveSync-Bridge app binary
+- bundled Ludusavi binary for that platform
+- bundled rclone binary for that platform
+- `.env.example`
+- `LICENSE`
+- `THIRD_PARTY_LICENSES.md`
+
+To create a GitHub release with both platform builds:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+To run an on-demand cloud build without publishing a release, use the `Cloud Build` workflow from the Actions tab.
+
 ## Features
 
-- **Path Translation**: Automatically maps save paths between Windows and Steam Deck (Proton/Wine compatdata)
+- **Path Translation**: Automatically maps save paths between Windows and Wine/Proton prefixes, including non-Steam launchers that Ludusavi detects under `drive_c`
 - **Conflict Resolution**: Metadata-driven sync with a visual conflict resolution dialog
 - **Sync Center**: Unified view of all games regardless of which machine they were last played on
 - **Ludusavi Integration**: Uses Ludusavi's `--api` mode for save discovery and backup/restore
@@ -50,6 +75,9 @@ uv run ruff format src/ tests/
 
 # Build a standalone executable
 uv run build-exe
+
+# Package the built executable into a release archive
+uv run package-release --version v0.1.0
 ```
 
 ## License
