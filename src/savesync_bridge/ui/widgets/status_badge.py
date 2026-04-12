@@ -13,7 +13,7 @@ class StatusBadge(QLabel):
     def __init__(self, status: SyncStatus, parent: object = None) -> None:
         super().__init__(parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setFixedHeight(24)
+        self.setFixedHeight(26)
         self.set_status(status)
 
     def set_status(self, status: SyncStatus) -> None:
@@ -22,11 +22,12 @@ class StatusBadge(QLabel):
         label = STATUS_LABELS.get(status, "UNKNOWN")
         self.setText(label)
         self.setStyleSheet(
-            f"background-color: {color}22; "
+            f"background-color: {color}18; "
             f"color: {color}; "
-            f"border: 1px solid {color}; "
-            f"border-radius: 10px; "
-            f"padding: 2px 10px; "
-            f"font-size: 10pt; "
-            f"font-weight: bold;"
+            f"border: 1px solid {color}44; "
+            f"border-radius: 13px; "
+            f"padding: 2px 12px; "
+            f"font-size: 9pt; "
+            f"font-weight: 600; "
+            f"letter-spacing: 0.5px;"
         )

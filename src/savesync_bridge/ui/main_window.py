@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QToolBar,
@@ -23,6 +24,7 @@ from savesync_bridge.core.config import (
     rclone_config_path,
     save_config,
 )
+from savesync_bridge.core.game_cache import load_games, save_games
 from savesync_bridge.core.path_translator import extract_wine_prefix_metadata
 from savesync_bridge.core.sync_engine import SyncEngine, SyncResult
 from savesync_bridge.models.game import Game, GameManifest, SyncStatus
@@ -61,6 +63,7 @@ class MainWindow(QMainWindow):
         self._config = config
         self._engine = engine
         self._games: dict[str, Game] = {}
+        self._active_workers: list[object] = []  # prevent GC of running QThreads
         self._config_dir = config_dir if config_dir is not None else default_config_dir()
         self._rclone_config_file = rclone_config_path(self._config_dir)
 
@@ -73,6 +76,11 @@ class MainWindow(QMainWindow):
         self._refresh_backup_panel()
         self._debug.log_info("SaveSync-Bridge started — click ▶ to expand console")
 
+        # Restore cached games so the UI is not empty on launch
+        self._restore_cached_games()
+        # Auto-refresh to detect new games
+        self._on_refresh()
+
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
@@ -83,19 +91,37 @@ class MainWindow(QMainWindow):
         toolbar.setObjectName("main_toolbar")
         self.addToolBar(toolbar)
 
-        self._refresh_action = toolbar.addAction("↻  Refresh All")
-        self._push_all_action = toolbar.addAction("⬆  Push All")
-        self._pull_all_action = toolbar.addAction("⬇  Pull All")
+        self._refresh_action = toolbar.addAction("\u21bb  Refresh")
+        self._push_all_action = toolbar.addAction("\u2b06  Push All")
+        self._pull_all_action = toolbar.addAction("\u2b07  Pull All")
         toolbar.addSeparator()
-        self._settings_action = toolbar.addAction("☁  Backups")
+        self._settings_action = toolbar.addAction("\u2601  Backups")
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         toolbar.addWidget(spacer)
 
         self._status_label = QLabel("Ready")
-        self._status_label.setStyleSheet("padding: 0 10px; color: #6c7086; font-size: 10pt;")
+        self._status_label.setStyleSheet(
+            "padding: 0 14px; color: #585b70; font-size: 9pt; font-weight: 500;"
+        )
         toolbar.addWidget(self._status_label)
+
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setFixedWidth(160)
+        self._progress_bar.setFixedHeight(14)
+        self._progress_bar.setTextVisible(False)
+        self._progress_bar.setVisible(False)
+        self._progress_bar.setStyleSheet(
+            "QProgressBar {"
+            "  background-color: #313244; border: 1px solid #45475a;"
+            "  border-radius: 7px;"
+            "}"
+            "QProgressBar::chunk {"
+            "  background-color: #cba6f7; border-radius: 6px;"
+            "}"
+        )
+        toolbar.addWidget(self._progress_bar)
 
     def _build_central(self) -> None:
         central = QWidget()
@@ -122,44 +148,48 @@ class MainWindow(QMainWindow):
         # ---- Sidebar ----
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(168)
+        sidebar.setFixedWidth(180)
 
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(10, 18, 10, 10)
+        sidebar_layout.setContentsMargins(12, 20, 12, 12)
         sidebar_layout.setSpacing(4)
 
         logo = QLabel("SaveSync\nBridge")
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         logo.setStyleSheet(
-            "font-size: 14pt; font-weight: bold; color: #cba6f7; "
-            "padding: 0 0 10px 0; background: transparent;"
+            "font-size: 15pt; font-weight: 700; color: #cba6f7; "
+            "padding: 0 0 12px 0; background: transparent; letter-spacing: -0.5px;"
         )
         sidebar_layout.addWidget(logo)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("background-color: #45475a; max-height: 1px; border: none;")
+        sep.setStyleSheet("background-color: #313244; max-height: 1px; border: none;")
         sidebar_layout.addWidget(sep)
-        sidebar_layout.addSpacing(10)
+        sidebar_layout.addSpacing(14)
 
-        filter_hdr = QLabel("GAMES FILTER")
+        filter_hdr = QLabel("FILTER")
         filter_hdr.setStyleSheet(
-            "font-size: 8pt; color: #6c7086; font-weight: bold; "
-            "letter-spacing: 1px; background: transparent;"
+            "font-size: 8pt; color: #585b70; font-weight: 600; "
+            "letter-spacing: 1.5px; background: transparent;"
         )
         sidebar_layout.addWidget(filter_hdr)
-        sidebar_layout.addSpacing(4)
+        sidebar_layout.addSpacing(6)
 
         self._filter_btns: list[tuple[SyncStatus | None, QPushButton]] = []
         for label, status in [
-            ("● All", None),
-            ("● Sync Issues", SyncStatus.LOCAL_NEWER),
-            ("● Conflicts", SyncStatus.CONFLICT),
+            ("\u25cf  All Games", None),
+            ("\u25cf  Local Newer", SyncStatus.LOCAL_NEWER),
+            ("\u25cf  Conflicts", SyncStatus.CONFLICT),
+            ("\u25cf  Synced", SyncStatus.SYNCED),
         ]:
             btn = QPushButton(label)
             btn.setCheckable(True)
             btn.setFlat(True)
-            btn.setStyleSheet("text-align: left; padding: 5px 8px; border-radius: 4px;")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(
+                "text-align: left; padding: 7px 10px; border-radius: 6px; font-size: 10pt;"
+            )
             sidebar_layout.addWidget(btn)
             self._filter_btns.append((status, btn))
 
@@ -177,34 +207,37 @@ class MainWindow(QMainWindow):
         backup_panel.setObjectName("backup_panel")
         backup_panel.setStyleSheet(
             "QFrame#backup_panel {"
-            "background-color: #181825; border-bottom: 1px solid #45475a;"
-            "padding: 12px 16px;"
+            "background-color: #181825; border-bottom: 1px solid #313244;"
             "}"
         )
         backup_layout = QHBoxLayout(backup_panel)
-        backup_layout.setContentsMargins(16, 14, 16, 14)
+        backup_layout.setContentsMargins(20, 16, 20, 16)
         backup_layout.setSpacing(16)
 
         summary_col = QVBoxLayout()
         summary_col.setSpacing(4)
-        backup_title = QLabel("Backup Destination")
-        backup_title.setStyleSheet("font-size: 12pt; font-weight: bold; color: #cba6f7;")
+        backup_title = QLabel("\u2601  Backup Destination")
+        backup_title.setStyleSheet(
+            "font-size: 11pt; font-weight: 600; color: #cba6f7;"
+        )
         summary_col.addWidget(backup_title)
 
         self._backup_status_label = QLabel()
         summary_col.addWidget(self._backup_status_label)
 
         self._backup_target_label = QLabel()
-        self._backup_target_label.setStyleSheet("color: #bac2de;")
+        self._backup_target_label.setStyleSheet("color: #bac2de; font-size: 9pt;")
         summary_col.addWidget(self._backup_target_label)
 
         self._backup_token_label = QLabel()
-        self._backup_token_label.setStyleSheet("color: #6c7086; font-size: 10pt;")
+        self._backup_token_label.setStyleSheet("color: #585b70; font-size: 9pt;")
         summary_col.addWidget(self._backup_token_label)
         backup_layout.addLayout(summary_col)
         backup_layout.addStretch()
 
         manage_backups_btn = QPushButton("Manage Backups")
+        manage_backups_btn.setObjectName("accent_btn")
+        manage_backups_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         manage_backups_btn.clicked.connect(self._on_settings)
         backup_layout.addWidget(manage_backups_btn)
 
@@ -259,15 +292,30 @@ class MainWindow(QMainWindow):
         worker.games_ready.connect(self._on_games_ready)
         worker.error.connect(self._on_worker_error)
         worker.finished.connect(lambda: self._refresh_action.setEnabled(True))
+        self._track_worker(worker)
         worker.start()
 
     def _on_games_ready(self, ludusavi_games: list[LudusaviGame]) -> None:
         games = [_ludusavi_to_game(lg) for lg in ludusavi_games]
-        self._games = {g.id: g for g in games}
-        self._game_list.set_games(games)
-        count = len(games)
+        # Attach local manifests so cards can show last-sync time
+        enriched: list[Game] = []
+        for g in games:
+            local_m = self._engine.get_local_manifest(g.id)
+            if local_m is not None:
+                g = Game(
+                    id=g.id, name=g.name, steam_app_id=g.steam_app_id,
+                    wine_prefix=g.wine_prefix, wine_user=g.wine_user,
+                    save_paths=g.save_paths, status=g.status,
+                    local_manifest=local_m, cloud_manifest=g.cloud_manifest,
+                )
+            enriched.append(g)
+        self._games = {g.id: g for g in enriched}
+        self._game_list.set_games(enriched)
+        count = len(enriched)
         self._set_status(f"{count} game(s) found")
         self._debug.log_info(f"Scan complete — {count} game(s) discovered")
+        # Persist for next launch
+        save_games(enriched, self._config_dir)
 
     def _on_push_all(self) -> None:
         game_ids = list(self._games.keys())
@@ -281,14 +329,37 @@ class MainWindow(QMainWindow):
         worker.game_updated.connect(
             lambda gid, res: self._debug.log_info(f"  push {gid} → {res.status.name}")
         )
+        worker.progress.connect(self._on_progress)
         worker.finished.connect(lambda: self._set_status("Push complete"))
         worker.finished.connect(lambda: self._debug.log_info("Push All complete"))
+        worker.finished.connect(self._hide_progress)
         worker.error.connect(self._on_worker_error)
+        self._track_worker(worker)
         worker.start()
 
     def _on_pull_all(self) -> None:
-        for game_id in list(self._games.keys()):
-            self._on_pull_game(game_id)
+        game_ids = list(self._games.keys())
+        if not game_ids:
+            self._set_status("No games to pull")
+            return
+        self._set_status(f"Fetching cloud manifests for {len(game_ids)} game(s)…")
+        self._debug.log_info(
+            f"Pull All → fetching manifests for {len(game_ids)} game(s)"
+        )
+        self._pull_all_action.setEnabled(False)
+        worker = FetchCloudManifestWorker(
+            self._engine, game_ids, parent=self,
+        )
+        self._pending_pull_specs: list[
+            tuple[str, GameManifest, str | None, str | None]
+        ] = []
+        worker.manifest_ready.connect(self._on_pull_all_manifest)
+        worker.progress.connect(self._on_progress)
+        worker.all_done.connect(self._on_pull_all_manifests_done)
+        worker.all_done.connect(self._hide_progress)
+        worker.error.connect(self._on_worker_error)
+        self._track_worker(worker)
+        worker.start()
 
     def _on_settings(self) -> None:
         from PySide6.QtWidgets import QDialog
@@ -307,10 +378,14 @@ class MainWindow(QMainWindow):
     def _on_push_game(self, game_id: str) -> None:
         self._set_status(f"Pushing {game_id}…")
         self._debug.log_info(f"Push → {game_id}")
-        worker = PushWorker(self._engine, [game_id], parent=self)
+        worker = PushWorker(
+            self._engine, [game_id], concurrency=1, parent=self,
+        )
         worker.game_updated.connect(self._on_game_updated)
         worker.game_updated.connect(
-            lambda gid, res: self._debug.log_info(f"  push {gid} → {res.status.name}")
+            lambda gid, res: self._debug.log_info(
+                f"  push {gid} → {res.status.name}"
+            )
         )
         worker.finished.connect(lambda: self._set_status("Push complete"))
         worker.error.connect(self._on_worker_error)
@@ -318,7 +393,9 @@ class MainWindow(QMainWindow):
 
     def _on_pull_game(self, game_id: str) -> None:
         self._set_status(f"Fetching cloud manifest for '{game_id}'…")
-        worker = FetchCloudManifestWorker(self._engine, game_id, parent=self)
+        worker = FetchCloudManifestWorker(
+            self._engine, [game_id], concurrency=1, parent=self,
+        )
         worker.manifest_ready.connect(self._on_cloud_manifest_fetched)
         worker.error.connect(self._on_worker_error)
         worker.start()
@@ -347,6 +424,7 @@ class MainWindow(QMainWindow):
         worker.conflict_detected.connect(self._on_conflict_detected)
         worker.finished.connect(lambda: self._set_status("Status check complete"))
         worker.error.connect(self._on_worker_error)
+        self._track_worker(worker)
         worker.start()
 
     # ------------------------------------------------------------------
@@ -354,29 +432,71 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _start_pull(self, game_id: str, manifest: GameManifest) -> None:
-        self._set_status(f"Pulling {game_id}…")
-        wine_prefix = self._games.get(game_id).wine_prefix if game_id in self._games else None
-        wine_user = self._games.get(game_id).wine_user if game_id in self._games else None
-        worker = PullWorker(
-            self._engine,
-            game_id,
-            manifest,
-            target_wine_prefix=wine_prefix,
-            target_wine_user=wine_user,
-            parent=self,
+        game = self._games.get(game_id)
+        wine_prefix = game.wine_prefix if game else None
+        wine_user = game.wine_user if game else None
+        self._start_pull_batch([
+            (game_id, manifest, wine_prefix, wine_user),
+        ])
+
+    def _start_pull_batch(
+        self,
+        specs: list[tuple[str, GameManifest, str | None, str | None]],
+    ) -> None:
+        count = len(specs)
+        self._set_status(f"Pulling {count} game(s)…")
+        self._debug.log_info(
+            f"Pull → {count} game(s): "
+            + ", ".join(gid for gid, *_ in specs)
         )
-        worker.finished.connect(self._on_pull_done)
+        worker = PullWorker(
+            self._engine, specs, parent=self,
+        )
+        worker.game_done.connect(self._on_game_updated)
+        worker.game_done.connect(
+            lambda gid, res: self._debug.log_info(
+                f"  pull {gid} → {res.status.name}"
+            )
+        )
+        worker.progress.connect(self._on_progress)
+        worker.finished.connect(
+            lambda: self._set_status("Pull complete")
+        )
+        worker.finished.connect(self._hide_progress)
         worker.error.connect(self._on_worker_error)
+        self._track_worker(worker)
         worker.start()
 
-    def _on_pull_done(self, game_id: str, result: SyncResult) -> None:
-        self._on_game_updated(game_id, result)
-        self._set_status("Pull complete")
+    def _on_pull_all_manifest(
+        self, game_id: str, manifest: object,
+    ) -> None:
+        if manifest is None:
+            self._debug.log_info(
+                f"  skip {game_id} — no cloud save"
+            )
+            return
+        game = self._games.get(game_id)
+        wine_prefix = game.wine_prefix if game else None
+        wine_user = game.wine_user if game else None
+        self._pending_pull_specs.append(
+            (game_id, manifest, wine_prefix, wine_user),  # type: ignore[arg-type]
+        )
+
+    def _on_pull_all_manifests_done(self) -> None:
+        self._pull_all_action.setEnabled(True)
+        specs = self._pending_pull_specs
+        self._pending_pull_specs = []
+        if not specs:
+            self._set_status("No cloud saves found")
+            return
+        self._start_pull_batch(specs)
 
     def _on_game_updated(self, game_id: str, result: SyncResult) -> None:
         if game_id not in self._games:
             return
         old = self._games[game_id]
+        # Re-read local manifest so last-sync time is current
+        local_m = self._engine.get_local_manifest(game_id) or old.local_manifest
         updated = Game(
             id=old.id,
             name=old.name,
@@ -385,7 +505,7 @@ class MainWindow(QMainWindow):
             wine_user=old.wine_user,
             save_paths=old.save_paths,
             status=result.status,
-            local_manifest=old.local_manifest,
+            local_manifest=local_m,
             cloud_manifest=old.cloud_manifest,
         )
         self._games[game_id] = updated
@@ -431,8 +551,44 @@ class MainWindow(QMainWindow):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _restore_cached_games(self) -> None:
+        """Load previously-discovered games from disk so the UI is not empty."""
+        from savesync_bridge.core.sync_engine import _default_state_dir
+
+        state_dir = self._engine._state_dir  # noqa: SLF001
+        cached = load_games(self._config_dir, state_dir=state_dir)
+        if cached:
+            self._games = {g.id: g for g in cached}
+            self._game_list.set_games(cached)
+            self._set_status(f"{len(cached)} cached game(s) loaded")
+            self._debug.log_info(
+                f"Restored {len(cached)} game(s) from cache"
+            )
+
     def _set_status(self, msg: str) -> None:
         self._status_label.setText(msg)
+
+    def _track_worker(self, worker: object) -> None:
+        """Keep a strong reference to *worker* so Python doesn't GC it mid-run."""
+        self._active_workers.append(worker)
+        worker.finished.connect(lambda w=worker: self._release_worker(w))  # type: ignore[union-attr]
+
+    def _release_worker(self, worker: object) -> None:
+        try:
+            self._active_workers.remove(worker)
+        except ValueError:
+            pass
+
+    def _on_progress(self, done: int, total: int) -> None:
+        if total <= 0:
+            self._progress_bar.setVisible(False)
+            return
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setMaximum(total)
+        self._progress_bar.setValue(done)
+
+    def _hide_progress(self) -> None:
+        self._progress_bar.setVisible(False)
 
     def _refresh_backup_panel(self, verified: bool = False) -> None:
         connected = has_remote_config(self._config.drive_remote, self._rclone_config_file)

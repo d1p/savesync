@@ -108,7 +108,7 @@ def configure_google_drive_remote(
             "type",
             "drive",
             "scope",
-            "drive",
+            "drive.file",
             "config_is_local",
             "true",
             "client_id",

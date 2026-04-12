@@ -26,10 +26,20 @@ def _format_last_sync(game: Game) -> str:
     if seconds < 60:
         return "Just now"
     if seconds < 3600:
-        return f"{seconds // 60} min ago"
+        m = seconds // 60
+        return f"{m} min ago"
     if seconds < 86400:
-        return f"{seconds // 3600} hr ago"
-    return f"{seconds // 86400} days ago"
+        h = seconds // 3600
+        return f"{h} hr ago"
+    d = seconds // 86400
+    return f"{d} day{'s' if d != 1 else ''} ago"
+
+
+def _format_sync_date(game: Game) -> str:
+    if game.local_manifest is None:
+        return ""
+    ts = game.local_manifest.timestamp
+    return ts.strftime("%b %d, %Y at %I:%M %p")
 
 
 class GameCard(QFrame):
@@ -48,47 +58,74 @@ class GameCard(QFrame):
 
     def _build_ui(self) -> None:
         outer = QHBoxLayout(self)
-        outer.setContentsMargins(12, 10, 12, 10)
-        outer.setSpacing(12)
+        outer.setContentsMargins(16, 14, 16, 14)
+        outer.setSpacing(14)
 
-        # Game icon
-        icon = QLabel("🎮")
-        icon.setStyleSheet("font-size: 24pt; background: transparent;")
-        icon.setAlignment(Qt.AlignmentFlag.AlignVCenter)
-        icon.setFixedWidth(36)
-        outer.addWidget(icon)
+        # Game icon container
+        icon_frame = QFrame()
+        icon_frame.setFixedSize(44, 44)
+        icon_frame.setStyleSheet(
+            "background-color: rgba(203, 166, 247, 0.1);"
+            "border-radius: 10px; border: none;"
+        )
+        icon_layout = QVBoxLayout(icon_frame)
+        icon_layout.setContentsMargins(0, 0, 0, 0)
+        icon = QLabel("\U0001f3ae")
+        icon.setStyleSheet("font-size: 20pt; background: transparent; border: none;")
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_layout.addWidget(icon)
+        outer.addWidget(icon_frame)
 
-        # Name + last-sync column
+        # Name + sync info column
         info_col = QVBoxLayout()
-        info_col.setSpacing(2)
+        info_col.setSpacing(3)
 
         self._name_label = QLabel()
         self._name_label.setStyleSheet(
-            "font-size: 13pt; font-weight: bold; background: transparent; color: #cdd6f4;"
-        )
-        self._sync_label = QLabel()
-        self._sync_label.setStyleSheet(
-            f"font-size: 10pt; color: {DARK_PALETTE['text_dim']}; background: transparent;"
+            "font-size: 11pt; font-weight: 600; background: transparent;"
+            "color: #cdd6f4; border: none;"
         )
         info_col.addWidget(self._name_label)
-        info_col.addWidget(self._sync_label)
-        outer.addLayout(info_col)
 
+        meta_row = QHBoxLayout()
+        meta_row.setSpacing(12)
+
+        self._sync_label = QLabel()
+        self._sync_label.setStyleSheet(
+            f"font-size: 9pt; color: {DARK_PALETTE['text_dim']};"
+            "background: transparent; border: none;"
+        )
+        meta_row.addWidget(self._sync_label)
+
+        self._date_label = QLabel()
+        self._date_label.setStyleSheet(
+            f"font-size: 9pt; color: {DARK_PALETTE['text_dim']};"
+            "background: transparent; border: none;"
+        )
+        meta_row.addWidget(self._date_label)
+        meta_row.addStretch()
+        info_col.addLayout(meta_row)
+
+        outer.addLayout(info_col)
         outer.addStretch()
 
         # Badge + action buttons
         right = QHBoxLayout()
-        right.setSpacing(6)
+        right.setSpacing(8)
 
         self._badge = StatusBadge(SyncStatus.UNKNOWN)
         right.addWidget(self._badge)
 
-        self._push_btn = QPushButton("⬆ Push")
-        self._pull_btn = QPushButton("⬇ Pull")
-        self._details_btn = QPushButton("≡ Details")
+        self._push_btn = QPushButton("\u2b06 Push")
+        self._push_btn.setObjectName("push_btn")
+        self._pull_btn = QPushButton("\u2b07 Pull")
+        self._pull_btn.setObjectName("pull_btn")
+        self._details_btn = QPushButton("\u2261 Sync")
+        self._details_btn.setObjectName("details_btn")
 
         for btn in (self._push_btn, self._pull_btn, self._details_btn):
-            btn.setFixedHeight(28)
+            btn.setFixedHeight(30)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
             right.addWidget(btn)
 
         self._push_btn.clicked.connect(lambda: self.push_requested.emit(self._game.id))
@@ -102,4 +139,5 @@ class GameCard(QFrame):
         self._game = game
         self._name_label.setText(game.name)
         self._sync_label.setText(_format_last_sync(game))
+        self._date_label.setText(_format_sync_date(game))
         self._badge.set_status(game.status)
