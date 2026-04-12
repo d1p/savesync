@@ -20,6 +20,7 @@ class AppConfig:
     ludusavi_path: str | None = None
     rclone_path: str | None = None
     known_games: list[str] = field(default_factory=list)
+    excluded_games: list[str] = field(default_factory=list)
 
 
 def default_config_dir() -> Path:
@@ -70,6 +71,7 @@ def load_config(config_dir: Path | None = None) -> AppConfig:
         ludusavi_path=data.get("ludusavi_path"),
         rclone_path=data.get("rclone_path"),
         known_games=list(data.get("known_games", [])),
+        excluded_games=list(data.get("excluded_games", [])),
     )
 
 
@@ -120,4 +122,5 @@ def _to_toml(cfg: AppConfig) -> str:
     if cfg.rclone_path is not None:
         lines.append(f"rclone_path = {_toml_str(cfg.rclone_path)}")
     lines.append(f"known_games = {_toml_array_of_str(cfg.known_games)}")
+    lines.append(f"excluded_games = {_toml_array_of_str(cfg.excluded_games)}")
     return "\n".join(lines) + "\n"

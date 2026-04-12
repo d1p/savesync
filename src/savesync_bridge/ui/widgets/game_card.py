@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -45,9 +46,8 @@ def _format_sync_date(game: Game) -> str:
 class GameCard(QFrame):
     """Card widget representing a single game with sync controls."""
 
-    push_requested = Signal(str)
-    pull_requested = Signal(str)
-    details_requested = Signal(str)
+    sync_requested = Signal(str)
+    exclude_toggled = Signal(str, bool)  # game_id, excluded
 
     def __init__(self, game: Game, parent: object = None) -> None:
         super().__init__(parent)
@@ -116,26 +116,33 @@ class GameCard(QFrame):
         self._badge = StatusBadge(SyncStatus.UNKNOWN)
         right.addWidget(self._badge)
 
-        self._push_btn = QPushButton("\u2b06 Push")
-        self._push_btn.setObjectName("push_btn")
-        self._push_btn.setToolTip("Upload this game's local save to Google Drive")
-        self._pull_btn = QPushButton("\u2b07 Pull")
-        self._pull_btn.setObjectName("pull_btn")
-        self._pull_btn.setToolTip("Download this game's cloud save and restore it locally")
-        self._details_btn = QPushButton("\u2261 Sync")
-        self._details_btn.setObjectName("details_btn")
-        self._details_btn.setToolTip("Smart sync: push, pull, or show conflict dialog as needed")
+        self._exclude_cb = QCheckBox()
+        self._exclude_cb.setToolTip("Exclude this game from sync")
+        self._exclude_cb.setStyleSheet(
+            "QCheckBox { spacing: 0px; background: transparent; border: none; }"
+            "QCheckBox::indicator { width: 16px; height: 16px; }"
+        )
+        right.addWidget(self._exclude_cb)
 
-        for btn in (self._push_btn, self._pull_btn, self._details_btn):
-            btn.setFixedHeight(30)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            right.addWidget(btn)
+        self._sync_btn = QPushButton("\u21bb Sync")
+        self._sync_btn.setObjectName("sync_btn")
+        self._sync_btn.setToolTip("Smart sync: push, pull, or show conflict dialog as needed")
 
-        self._push_btn.clicked.connect(lambda: self.push_requested.emit(self._game.id))
-        self._pull_btn.clicked.connect(lambda: self.pull_requested.emit(self._game.id))
-        self._details_btn.clicked.connect(lambda: self.details_requested.emit(self._game.id))
+        self._sync_btn.setFixedHeight(30)
+        self._sync_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        right.addWidget(self._sync_btn)
+
+        self._sync_btn.clicked.connect(lambda: self.sync_requested.emit(self._game.id))
+        self._exclude_cb.toggled.connect(self._on_exclude_toggled)
 
         outer.addLayout(right)
+
+    def _on_exclude_toggled(self, checked: bool) -> None:
+        self.exclude_toggled.emit(self._game.id, checked)
+        self._sync_btn.setEnabled(not checked)
+        self._sync_btn.setStyleSheet(
+            "opacity: 0.4;" if checked else ""
+        )
 
     def update_game(self, game: Game) -> None:
         """Refresh displayed data from *game*."""
@@ -144,3 +151,8 @@ class GameCard(QFrame):
         self._sync_label.setText(_format_last_sync(game))
         self._date_label.setText(_format_sync_date(game))
         self._badge.set_status(game.status)
+        # Update exclude checkbox without retriggering signal
+        self._exclude_cb.blockSignals(True)
+        self._exclude_cb.setChecked(game.excluded)
+        self._exclude_cb.blockSignals(False)
+        self._sync_btn.setEnabled(not game.excluded)

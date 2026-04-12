@@ -52,6 +52,22 @@ def _mock_popen(proc: MagicMock):
     return patch("subprocess.Popen", return_value=popen_inst)
 
 
+def _mock_popen_streaming(proc: MagicMock):
+    """Like _mock_popen but for _invoke_auth which iterates stderr line-by-line
+    and calls stdout.read()."""
+    popen_inst = MagicMock()
+    stderr_text = proc.stderr or ""
+    popen_inst.stderr.__iter__ = MagicMock(
+        return_value=iter(stderr_text.splitlines(keepends=True) if stderr_text else [])
+    )
+    stdout_text = proc.stdout or ""
+    popen_inst.stdout.read.return_value = stdout_text
+    popen_inst.returncode = proc.returncode
+    popen_inst.poll.return_value = proc.returncode
+    popen_inst.wait.return_value = proc.returncode
+    return patch("subprocess.Popen", return_value=popen_inst)
+
+
 class TestUpload:
     def test_cli_args(self, tmp_path: Path) -> None:
         proc = _make_proc()
@@ -182,7 +198,7 @@ class TestDriveConfigHelpers:
     def test_configure_google_drive_remote_creates_remote(self, tmp_path: Path) -> None:
         proc = _make_proc(stdout="ok")
         config_file = tmp_path / "rclone.conf"
-        with _mock_popen(proc) as mock_popen:
+        with _mock_popen_streaming(proc) as mock_popen:
             configure_google_drive_remote(
                 "gdrive",
                 config_file,
@@ -191,7 +207,8 @@ class TestDriveConfigHelpers:
                 binary=FAKE_BINARY,
             )
         args = mock_popen.call_args[0][0]
-        assert args[:5] == [str(FAKE_BINARY), "--config", str(config_file), "config", "create"]
+        assert "--no-browser" in args
+        assert "config" in args and "create" in args
         assert "client_id" in args and "client-id" in args
         assert "client_secret" in args and "client-secret" in args
 
@@ -199,17 +216,19 @@ class TestDriveConfigHelpers:
         proc = _make_proc(stdout="ok")
         config_file = tmp_path / "rclone.conf"
         config_file.write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
-        with _mock_popen(proc) as mock_popen:
+        with _mock_popen_streaming(proc) as mock_popen:
             configure_google_drive_remote("gdrive", config_file, binary=FAKE_BINARY)
         args = mock_popen.call_args[0][0]
-        assert args[:5] == [str(FAKE_BINARY), "--config", str(config_file), "config", "update"]
+        assert "--no-browser" in args
+        assert "config" in args and "update" in args
 
     def test_reconnect_google_drive_remote_uses_reconnect_command(self, tmp_path: Path) -> None:
         proc = _make_proc(stdout="ok")
         config_file = tmp_path / "rclone.conf"
-        with _mock_popen(proc) as mock_popen:
+        with _mock_popen_streaming(proc) as mock_popen:
             reconnect_google_drive_remote("gdrive", config_file, binary=FAKE_BINARY)
         args = mock_popen.call_args[0][0]
+        assert "--no-browser" in args
         assert args[-3:] == ["config", "reconnect", "gdrive:"]
 
     def test_delete_remote_config_skips_missing_remote(self, tmp_path: Path) -> None:

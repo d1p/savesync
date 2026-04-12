@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sys
+import tarfile
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -14,7 +15,7 @@ from savesync_bridge.core import manifest as manifest_module
 from savesync_bridge.core.backup_converter import convert_simple_backup_for_restore
 from savesync_bridge.core.config import AppConfig
 from savesync_bridge.core.exceptions import LudusaviError, RcloneError, SyncError
-from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncStatus
+from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncMeta, SyncStatus
 
 
 @dataclass
@@ -135,14 +136,7 @@ class SyncEngine:
     # ------------------------------------------------------------------
 
     def get_cloud_manifest(self, game_id: str) -> GameManifest | None:
-        """Fetch manifest.json from cloud storage for *game_id*. Returns ``None`` if absent.
-
-        Args:
-            game_id: Ludusavi game identifier.
-
-        Returns:
-            Parsed :class:`~savesync_bridge.models.game.GameManifest`, or ``None``.
-        """
+        """Fetch manifest.json from cloud storage for *game_id*. Returns ``None`` if absent."""
         key = f"{self._cloud_prefix(game_id)}/manifest.json"
         try:
             raw = rclone.read_file(
@@ -157,14 +151,28 @@ class SyncEngine:
         except RcloneError:
             return None
 
+    def _get_cloud_sync_meta(self, game_id: str) -> SyncMeta | None:
+        """Fetch lightweight sync_meta.json from cloud. Returns ``None`` if absent."""
+        key = f"{self._cloud_prefix(game_id)}/sync_meta.json"
+        try:
+            raw = rclone.read_file(
+                self._config.drive_remote,
+                self._config.drive_root,
+                key,
+                env=self._env,
+                binary=self._rclone_bin,
+                config_file=self._rclone_config_file,
+            )
+            return manifest_module.sync_meta_from_json(raw.decode("utf-8"))
+        except (RcloneError, json.JSONDecodeError, KeyError, ValueError):
+            return None
+
     def push(self, game_id: str) -> SyncResult:
-        """Back up *game_id* via Ludusavi and upload the result to cloud storage.
+        """Back up *game_id* via Ludusavi, compress, and upload to cloud storage.
 
-        Args:
-            game_id: Ludusavi game identifier.
-
-        Returns:
-            :class:`SyncResult` with status ``SYNCED`` on success, ``UNKNOWN`` on error.
+        The save files are compressed into a tar.gz archive before uploading.
+        A lightweight sync_meta.json is uploaded alongside for fast status checks.
+        The full manifest.json is also uploaded for backward compatibility.
         """
         try:
             with tempfile.TemporaryDirectory() as staging:
@@ -178,15 +186,36 @@ class SyncEngine:
                 # 2. Build a content manifest
                 m = _build_manifest(game_id, game_dir)
 
-                # 3. Write manifest.json into staging
+                # 3. Compress save files into archive
+                archive_name = "save.tar.gz"
+                archive_path = staging_path / archive_name
+                with tarfile.open(archive_path, "w:gz") as tar:
+                    tar.add(game_dir, arcname=game_id)
+                archive_size = archive_path.stat().st_size
+
+                # 4. Write manifest.json into staging (backward compat)
                 manifest_file = staging_path / "manifest.json"
                 manifest_file.write_text(manifest_module.to_json(m), encoding="utf-8")
 
+                # 5. Write sync_meta.json (lightweight, for fast status check)
+                sync_meta = SyncMeta(
+                    game_id=game_id,
+                    hash=m.hash,
+                    timestamp=m.timestamp,
+                    compressed=True,
+                    archive_name=archive_name,
+                    total_size=archive_size,
+                )
+                meta_file = staging_path / "sync_meta.json"
+                meta_file.write_text(
+                    manifest_module.sync_meta_to_json(sync_meta), encoding="utf-8",
+                )
+
                 prefix = self._cloud_prefix(game_id)
 
-                # 4. Upload game-save files
+                # 6. Upload compressed archive (single file instead of many)
                 rclone.upload(
-                    game_dir,
+                    archive_path,
                     self._config.drive_remote,
                     self._config.drive_root,
                     prefix,
@@ -195,7 +224,7 @@ class SyncEngine:
                     config_file=self._rclone_config_file,
                 )
 
-                # 5. Upload manifest.json
+                # 7. Upload manifest.json
                 rclone.upload(
                     manifest_file,
                     self._config.drive_remote,
@@ -206,7 +235,18 @@ class SyncEngine:
                     config_file=self._rclone_config_file,
                 )
 
-                # 6. Persist manifest locally so check_status can diff later
+                # 8. Upload sync_meta.json
+                rclone.upload(
+                    meta_file,
+                    self._config.drive_remote,
+                    self._config.drive_root,
+                    prefix,
+                    env=self._env,
+                    binary=self._rclone_bin,
+                    config_file=self._rclone_config_file,
+                )
+
+                # 9. Persist manifest locally so check_status can diff later
                 self._save_local_manifest(m)
 
                 return SyncResult(game_id=game_id, status=SyncStatus.SYNCED)
@@ -223,12 +263,7 @@ class SyncEngine:
     ) -> SyncResult:
         """Download saves from cloud storage and restore them via Ludusavi.
 
-        Args:
-            game_id: Ludusavi game identifier.
-            manifest: The cloud manifest describing the save to restore.
-
-        Returns:
-            :class:`SyncResult` with status ``SYNCED`` on success, ``UNKNOWN`` on error.
+        Supports both compressed archives (v2+) and legacy uncompressed saves.
         """
         try:
             with tempfile.TemporaryDirectory() as staging:
@@ -238,16 +273,52 @@ class SyncEngine:
 
                 prefix = self._cloud_prefix(game_id)
 
-                # 1. Download from S3
-                rclone.download(
-                    self._config.drive_remote,
-                    self._config.drive_root,
-                    prefix,
-                    game_dir,
-                    env=self._env,
-                    binary=self._rclone_bin,
-                    config_file=self._rclone_config_file,
-                )
+                # Check if cloud save is compressed (v2 format)
+                sync_meta = self._get_cloud_sync_meta(game_id)
+                if sync_meta is not None and sync_meta.compressed:
+                    # Download compressed archive
+                    archive_key = f"{prefix}/{sync_meta.archive_name}"
+                    try:
+                        archive_data = rclone.read_file(
+                            self._config.drive_remote,
+                            self._config.drive_root,
+                            archive_key,
+                            env=self._env,
+                            binary=self._rclone_bin,
+                            config_file=self._rclone_config_file,
+                        )
+                        archive_path = staging_path / sync_meta.archive_name
+                        archive_path.write_bytes(archive_data)
+                        with tarfile.open(archive_path, "r:gz") as tar:
+                            # Security: validate paths to prevent path traversal
+                            for member in tar.getmembers():
+                                if member.name.startswith("/") or ".." in member.name:
+                                    raise SyncError(
+                                        f"Unsafe path in archive: {member.name}"
+                                    )
+                            tar.extractall(staging_path)
+                    except RcloneError:
+                        # Archive not found — fall back to legacy download
+                        rclone.download(
+                            self._config.drive_remote,
+                            self._config.drive_root,
+                            prefix,
+                            game_dir,
+                            env=self._env,
+                            binary=self._rclone_bin,
+                            config_file=self._rclone_config_file,
+                        )
+                else:
+                    # Legacy: download individual files
+                    rclone.download(
+                        self._config.drive_remote,
+                        self._config.drive_root,
+                        prefix,
+                        game_dir,
+                        env=self._env,
+                        binary=self._rclone_bin,
+                        config_file=self._rclone_config_file,
+                    )
 
                 convert_simple_backup_for_restore(
                     game_dir,
@@ -258,10 +329,10 @@ class SyncEngine:
                     env=self._conversion_env(),
                 )
 
-                # 2. Restore via Ludusavi
+                # Restore via Ludusavi
                 ludusavi.restore_game(game_id, game_dir, binary=self._ludusavi_bin)
 
-                # 3. Cache the cloud manifest locally
+                # Cache the cloud manifest locally
                 self._save_local_manifest(manifest)
 
                 return SyncResult(game_id=game_id, status=SyncStatus.SYNCED)
@@ -270,17 +341,21 @@ class SyncEngine:
             return SyncResult(game_id=game_id, status=SyncStatus.UNKNOWN, error=str(exc))
 
     def check_status(self, game_id: str) -> SyncResult:
-        """Compare the local cached manifest with the cloud manifest.
+        """Compare the local cached manifest with the cloud sync metadata.
 
-        Args:
-            game_id: Ludusavi game identifier.
-
-        Returns:
-            :class:`SyncResult` reflecting ``SYNCED``, ``LOCAL_NEWER``,
-            ``CLOUD_NEWER``, ``CONFLICT``, or ``UNKNOWN``.
+        Tries the lightweight sync_meta.json first for speed, then falls back
+        to the full manifest.json for backward compatibility.
         """
-        cloud = self.get_cloud_manifest(game_id)
         local = self._get_local_manifest(game_id)
+
+        # Fast path: try lightweight sync_meta.json
+        cloud_meta = self._get_cloud_sync_meta(game_id)
+        if cloud_meta is not None and local is not None:
+            status = manifest_module.compare_meta(local, cloud_meta)
+            return SyncResult(game_id=game_id, status=status)
+
+        # Slow path: fall back to full manifest
+        cloud = self.get_cloud_manifest(game_id)
 
         if cloud is None and local is None:
             return SyncResult(game_id=game_id, status=SyncStatus.UNKNOWN)

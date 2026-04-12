@@ -8,7 +8,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
-    QMessageBox,
     QProgressBar,
     QPushButton,
     QSizePolicy,
@@ -28,7 +27,7 @@ from savesync_bridge.core.config import (
 from savesync_bridge.core.game_cache import load_games, save_games
 from savesync_bridge.core.path_translator import extract_wine_prefix_metadata
 from savesync_bridge.core.sync_engine import SyncEngine, SyncResult
-from savesync_bridge.models.game import Game, GameManifest, SyncStatus
+from savesync_bridge.models.game import Game, SyncStatus
 from savesync_bridge.ui.conflict_dialog import ConflictDialog
 from savesync_bridge.ui.settings_dialog import SettingsDialog
 from savesync_bridge.ui.widgets.debug_panel import DebugPanel
@@ -42,7 +41,7 @@ from savesync_bridge.ui.workers import (
 )
 
 
-def _ludusavi_to_game(lg: LudusaviGame) -> Game:
+def _ludusavi_to_game(lg: LudusaviGame, excluded_ids: set[str] | None = None) -> Game:
     steam_app_id, wine_prefix, wine_user = extract_wine_prefix_metadata(lg.save_paths)
     return Game(
         id=lg.name,
@@ -51,6 +50,7 @@ def _ludusavi_to_game(lg: LudusaviGame) -> Game:
         wine_prefix=wine_prefix,
         wine_user=wine_user,
         save_paths=tuple(lg.save_paths),
+        excluded=lg.name in (excluded_ids or set()),
     )
 
 
@@ -94,10 +94,8 @@ class MainWindow(QMainWindow):
 
         self._refresh_action = toolbar.addAction("\u21bb  Refresh")
         self._refresh_action.setToolTip("Re-scan local games with Ludusavi")
-        self._push_all_action = toolbar.addAction("\u2b06  Push All")
-        self._push_all_action.setToolTip("Upload all local saves to Google Drive")
-        self._pull_all_action = toolbar.addAction("\u2b07  Pull All")
-        self._pull_all_action.setToolTip("Download all cloud saves and restore them locally")
+        self._sync_all_action = toolbar.addAction("\u21bb  Sync All")
+        self._sync_all_action.setToolTip("Smart sync all non-excluded games with Google Drive")
         toolbar.addSeparator()
         self._settings_action = toolbar.addAction("\u2601  Backups")
         self._settings_action.setToolTip("Open Google Drive and backup settings")
@@ -181,12 +179,13 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(filter_hdr)
         sidebar_layout.addSpacing(6)
 
-        self._filter_btns: list[tuple[SyncStatus | None, QPushButton]] = []
+        self._filter_btns: list[tuple[SyncStatus | None | str, QPushButton]] = []
         for label, status, tip in [
             ("\u25cf  All Games", None, "Show all discovered games"),
             ("\u25cf  Local Newer", SyncStatus.LOCAL_NEWER, "Show games whose local save is newer than the cloud"),
             ("\u25cf  Conflicts", SyncStatus.CONFLICT, "Show games with conflicting local and cloud saves"),
             ("\u25cf  Synced", SyncStatus.SYNCED, "Show games that are in sync with the cloud"),
+            ("\u25cf  Excluded", "excluded", "Show games excluded from sync"),
         ]:
             btn = QPushButton(label)
             btn.setCheckable(True)
@@ -264,13 +263,11 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self._refresh_action.triggered.connect(self._on_refresh)
-        self._push_all_action.triggered.connect(self._on_push_all)
-        self._pull_all_action.triggered.connect(self._on_pull_all)
+        self._sync_all_action.triggered.connect(self._on_sync_all)
         self._settings_action.triggered.connect(self._on_settings)
 
-        self._game_list.push_requested.connect(self._on_push_game)
-        self._game_list.pull_requested.connect(self._on_pull_game)
-        self._game_list.details_requested.connect(self._on_details_game)
+        self._game_list.sync_requested.connect(self._on_sync_game)
+        self._game_list.exclude_toggled.connect(self._on_exclude_toggled)
 
         for status, btn in self._filter_btns:
             btn.clicked.connect(lambda _checked, s=status: self._on_filter(s))
@@ -303,7 +300,8 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_games_ready(self, ludusavi_games: list[LudusaviGame]) -> None:
-        games = [_ludusavi_to_game(lg) for lg in ludusavi_games]
+        excluded_ids = set(self._config.excluded_games)
+        games = [_ludusavi_to_game(lg, excluded_ids) for lg in ludusavi_games]
         # Attach local manifests so cards can show last-sync time
         enriched: list[Game] = []
         for g in games:
@@ -313,6 +311,7 @@ class MainWindow(QMainWindow):
                     id=g.id, name=g.name, steam_app_id=g.steam_app_id,
                     wine_prefix=g.wine_prefix, wine_user=g.wine_user,
                     save_paths=g.save_paths, status=g.status,
+                    excluded=g.excluded,
                     local_manifest=local_m, cloud_manifest=g.cloud_manifest,
                 )
             enriched.append(g)
@@ -324,46 +323,36 @@ class MainWindow(QMainWindow):
         # Persist for next launch
         save_games(enriched, self._config_dir)
 
-    def _on_push_all(self) -> None:
-        game_ids = list(self._games.keys())
+    def _on_sync_all(self) -> None:
+        """Smart-sync all non-excluded games."""
+        game_ids = [
+            gid for gid, g in self._games.items() if not g.excluded
+        ]
         if not game_ids:
-            self._set_status("No games to push")
+            self._set_status("No games to sync (all excluded or none found)")
             return
-        self._set_status(f"Pushing {len(game_ids)} game(s)…")
-        self._debug.log_info(f"Push All → {len(game_ids)} game(s): {', '.join(game_ids)}")
-        worker = PushWorker(self._engine, game_ids, parent=self)
+        self._set_status(f"Syncing {len(game_ids)} game(s)…")
+        self._debug.log_info(
+            f"Sync All → {len(game_ids)} game(s): {', '.join(game_ids)}"
+        )
+        wine_contexts = {
+            gid: (self._games[gid].wine_prefix, self._games[gid].wine_user)
+            for gid in game_ids
+        }
+        worker = SyncWorker(
+            self._engine, game_ids,
+            target_wine_contexts=wine_contexts,
+            parent=self,
+        )
         worker.game_updated.connect(self._on_game_updated)
         worker.game_updated.connect(
-            lambda gid, res: self._debug.log_info(f"  push {gid} → {res.status.name}")
+            lambda gid, res: self._debug.log_info(f"  sync {gid} → {res.status.name}")
         )
+        worker.conflict_detected.connect(self._on_conflict_detected)
         worker.progress.connect(self._on_progress)
-        worker.finished.connect(lambda: self._set_status("Push complete"))
-        worker.finished.connect(lambda: self._debug.log_info("Push All complete"))
+        worker.finished.connect(lambda: self._set_status("Sync complete"))
+        worker.finished.connect(lambda: self._debug.log_info("Sync All complete"))
         worker.finished.connect(self._hide_progress)
-        worker.error.connect(self._on_worker_error)
-        self._track_worker(worker)
-        worker.start()
-
-    def _on_pull_all(self) -> None:
-        game_ids = list(self._games.keys())
-        if not game_ids:
-            self._set_status("No games to pull")
-            return
-        self._set_status(f"Fetching cloud manifests for {len(game_ids)} game(s)…")
-        self._debug.log_info(
-            f"Pull All → fetching manifests for {len(game_ids)} game(s)"
-        )
-        self._pull_all_action.setEnabled(False)
-        worker = FetchCloudManifestWorker(
-            self._engine, game_ids, parent=self,
-        )
-        self._pending_pull_specs: list[
-            tuple[str, GameManifest, str | None, str | None]
-        ] = []
-        worker.manifest_ready.connect(self._on_pull_all_manifest)
-        worker.progress.connect(self._on_progress)
-        worker.all_done.connect(self._on_pull_all_manifests_done)
-        worker.all_done.connect(self._hide_progress)
         worker.error.connect(self._on_worker_error)
         self._track_worker(worker)
         worker.start()
@@ -382,40 +371,13 @@ class MainWindow(QMainWindow):
     # Game-card slots
     # ------------------------------------------------------------------
 
-    def _on_push_game(self, game_id: str) -> None:
-        self._set_status(f"Pushing {game_id}…")
-        self._debug.log_info(f"Push → {game_id}")
-        worker = PushWorker(
-            self._engine, [game_id], concurrency=1, parent=self,
-        )
-        worker.game_updated.connect(self._on_game_updated)
-        worker.game_updated.connect(
-            lambda gid, res: self._debug.log_info(
-                f"  push {gid} → {res.status.name}"
-            )
-        )
-        worker.finished.connect(lambda: self._set_status("Push complete"))
-        worker.error.connect(self._on_worker_error)
-        worker.start()
-
-    def _on_pull_game(self, game_id: str) -> None:
-        self._set_status(f"Fetching cloud manifest for '{game_id}'…")
-        worker = FetchCloudManifestWorker(
-            self._engine, [game_id], concurrency=1, parent=self,
-        )
-        worker.manifest_ready.connect(self._on_cloud_manifest_fetched)
-        worker.error.connect(self._on_worker_error)
-        worker.start()
-
-    def _on_cloud_manifest_fetched(self, game_id: str, cloud: object) -> None:
-        if cloud is None:
-            self._set_status(f"No cloud save found for '{game_id}'")
+    def _on_sync_game(self, game_id: str) -> None:
+        """Trigger a smart sync for a single game; shows conflict dialog if needed."""
+        if game_id in self._games and self._games[game_id].excluded:
+            self._set_status(f"'{game_id}' is excluded from sync")
             return
-        self._start_pull(game_id, cloud)  # type: ignore[arg-type]
-
-    def _on_details_game(self, game_id: str) -> None:
-        """Trigger a smart sync for the game; shows conflict dialog if needed."""
-        self._set_status(f"Checking sync status for {game_id}…")
+        self._set_status(f"Syncing {game_id}…")
+        self._debug.log_info(f"Sync → {game_id}")
         worker = SyncWorker(
             self._engine,
             [game_id],
@@ -428,111 +390,43 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         worker.game_updated.connect(self._on_game_updated)
+        worker.game_updated.connect(
+            lambda gid, res: self._debug.log_info(f"  sync {gid} → {res.status.name}")
+        )
         worker.conflict_detected.connect(self._on_conflict_detected)
-        worker.finished.connect(lambda: self._set_status("Status check complete"))
+        worker.finished.connect(lambda: self._set_status("Sync complete"))
         worker.error.connect(self._on_worker_error)
         self._track_worker(worker)
         worker.start()
+
+    def _on_exclude_toggled(self, game_id: str, excluded: bool) -> None:
+        """Persist the exclusion state for a game."""
+        if game_id not in self._games:
+            return
+        old = self._games[game_id]
+        updated = Game(
+            id=old.id, name=old.name, steam_app_id=old.steam_app_id,
+            wine_prefix=old.wine_prefix, wine_user=old.wine_user,
+            save_paths=old.save_paths, status=old.status,
+            excluded=excluded,
+            local_manifest=old.local_manifest, cloud_manifest=old.cloud_manifest,
+        )
+        self._games[game_id] = updated
+        # Update persisted exclusion list
+        excluded_set = set(self._config.excluded_games)
+        if excluded:
+            excluded_set.add(game_id)
+        else:
+            excluded_set.discard(game_id)
+        self._config.excluded_games = sorted(excluded_set)
+        save_config(self._config, config_dir=self._config_dir)
+        self._debug.log_info(
+            f"{'Excluded' if excluded else 'Included'} '{game_id}' from sync"
+        )
 
     # ------------------------------------------------------------------
     # Worker result handlers
     # ------------------------------------------------------------------
-
-    def _start_pull(self, game_id: str, manifest: GameManifest) -> None:
-        game = self._games.get(game_id)
-        wine_prefix = game.wine_prefix if game else None
-        wine_user = game.wine_user if game else None
-        if self._local_is_newer(game_id, manifest):
-            answer = QMessageBox.question(
-                self,
-                "Overwrite newer local save?",
-                f"Your local save for \u201c{game_id}\u201d is newer than the cloud version.\n\n"
-                "Pulling will overwrite it. Continue?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                self._set_status("Pull cancelled")
-                return
-        self._start_pull_batch([
-            (game_id, manifest, wine_prefix, wine_user),
-        ])
-
-    def _start_pull_batch(
-        self,
-        specs: list[tuple[str, GameManifest, str | None, str | None]],
-    ) -> None:
-        count = len(specs)
-        self._set_status(f"Pulling {count} game(s)…")
-        self._debug.log_info(
-            f"Pull → {count} game(s): "
-            + ", ".join(gid for gid, *_ in specs)
-        )
-        worker = PullWorker(
-            self._engine, specs, parent=self,
-        )
-        worker.game_done.connect(self._on_game_updated)
-        worker.game_done.connect(
-            lambda gid, res: self._debug.log_info(
-                f"  pull {gid} → {res.status.name}"
-            )
-        )
-        worker.progress.connect(self._on_progress)
-        worker.finished.connect(
-            lambda: self._set_status("Pull complete")
-        )
-        worker.finished.connect(self._hide_progress)
-        worker.error.connect(self._on_worker_error)
-        self._track_worker(worker)
-        worker.start()
-
-    def _on_pull_all_manifest(
-        self, game_id: str, manifest: object,
-    ) -> None:
-        if manifest is None:
-            self._debug.log_info(
-                f"  skip {game_id} — no cloud save"
-            )
-            return
-        game = self._games.get(game_id)
-        wine_prefix = game.wine_prefix if game else None
-        wine_user = game.wine_user if game else None
-        self._pending_pull_specs.append(
-            (game_id, manifest, wine_prefix, wine_user),  # type: ignore[arg-type]
-        )
-
-    def _on_pull_all_manifests_done(self) -> None:
-        self._pull_all_action.setEnabled(True)
-        specs = self._pending_pull_specs
-        self._pending_pull_specs = []
-        if not specs:
-            self._set_status("No cloud saves found")
-            return
-        # Filter out specs where local save is newer — ask once for all of them.
-        newer_local = [
-            gid for gid, cloud_m, *_ in specs
-            if self._local_is_newer(gid, cloud_m)
-        ]
-        if newer_local:
-            names = ", ".join(newer_local[:5])
-            suffix = f" and {len(newer_local) - 5} more" if len(newer_local) > 5 else ""
-            answer = QMessageBox.question(
-                self,
-                "Overwrite newer local saves?",
-                f"{len(newer_local)} game(s) have a local save newer than the cloud version:\n"
-                f"{names}{suffix}\n\n"
-                "Include them in the pull (overwriting local), or skip them?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                specs = [
-                    s for s in specs if s[0] not in newer_local
-                ]
-                if not specs:
-                    self._set_status("Pull cancelled — all games had newer local saves")
-                    return
-        self._start_pull_batch(specs)
 
     def _on_game_updated(self, game_id: str, result: SyncResult) -> None:
         if game_id not in self._games:
@@ -548,6 +442,7 @@ class MainWindow(QMainWindow):
             wine_user=old.wine_user,
             save_paths=old.save_paths,
             status=result.status,
+            excluded=old.excluded,
             local_manifest=local_m,
             cloud_manifest=old.cloud_manifest,
         )
@@ -572,10 +467,53 @@ class MainWindow(QMainWindow):
         dlg.exec()
         choice = dlg.get_choice()
         if choice == ConflictDialog.Choice.KEEP_LOCAL:
-            self._on_push_game(game_id)
+            self._force_push_game(game_id)
         elif choice == ConflictDialog.Choice.KEEP_CLOUD:
-            self._on_pull_game(game_id)
+            self._force_pull_game(game_id)
         # KEEP_NEITHER → do nothing
+
+    def _force_push_game(self, game_id: str) -> None:
+        """Force-push a single game (used after conflict resolution)."""
+        self._set_status(f"Pushing {game_id}…")
+        self._debug.log_info(f"Force push → {game_id}")
+        worker = PushWorker(
+            self._engine, [game_id], concurrency=1, parent=self,
+        )
+        worker.game_updated.connect(self._on_game_updated)
+        worker.finished.connect(lambda: self._set_status("Push complete"))
+        worker.error.connect(self._on_worker_error)
+        self._track_worker(worker)
+        worker.start()
+
+    def _force_pull_game(self, game_id: str) -> None:
+        """Force-pull a single game (used after conflict resolution)."""
+        self._set_status(f"Fetching cloud manifest for '{game_id}'…")
+        worker = FetchCloudManifestWorker(
+            self._engine, [game_id], concurrency=1, parent=self,
+        )
+        worker.manifest_ready.connect(self._on_force_pull_manifest_ready)
+        worker.error.connect(self._on_worker_error)
+        self._track_worker(worker)
+        worker.start()
+
+    def _on_force_pull_manifest_ready(self, game_id: str, manifest: object) -> None:
+        if manifest is None:
+            self._set_status(f"No cloud save found for '{game_id}'")
+            return
+        game = self._games.get(game_id)
+        wine_prefix = game.wine_prefix if game else None
+        wine_user = game.wine_user if game else None
+        self._set_status(f"Pulling {game_id}…")
+        worker = PullWorker(
+            self._engine,
+            [(game_id, manifest, wine_prefix, wine_user)],
+            parent=self,
+        )
+        worker.game_done.connect(self._on_game_updated)
+        worker.finished.connect(lambda: self._set_status("Pull complete"))
+        worker.error.connect(self._on_worker_error)
+        self._track_worker(worker)
+        worker.start()
 
     def _on_worker_error(self, msg: str) -> None:
         self._set_status(f"Error: {msg}")
@@ -585,7 +523,7 @@ class MainWindow(QMainWindow):
     # Filter
     # ------------------------------------------------------------------
 
-    def _on_filter(self, status: SyncStatus | None) -> None:
+    def _on_filter(self, status: SyncStatus | None | str) -> None:
         for s, btn in self._filter_btns:
             btn.setChecked(s == status)
         self._game_list.set_filter(status)
@@ -593,13 +531,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _local_is_newer(self, game_id: str, cloud_manifest: GameManifest) -> bool:
-        """Return True if the local manifest is newer than *cloud_manifest*."""
-        local = self._engine.get_local_manifest(game_id)
-        if local is None:
-            return False
-        return local.timestamp > cloud_manifest.timestamp
 
     def _restore_cached_games(self) -> None:
         """Load previously-discovered games from disk so the UI is not empty."""

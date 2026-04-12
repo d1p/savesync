@@ -23,6 +23,7 @@ def save_games(games: list[Game], config_dir: Path) -> None:
             "wine_prefix": g.wine_prefix,
             "wine_user": g.wine_user,
             "save_paths": list(g.save_paths),
+            "excluded": g.excluded,
         }
         for g in games
     ]
@@ -52,6 +53,7 @@ def load_games(config_dir: Path, state_dir: Path | None = None) -> list[Game]:
                 wine_prefix=entry.get("wine_prefix"),
                 wine_user=entry.get("wine_user"),
                 save_paths=tuple(entry.get("save_paths", ())),
+                excluded=entry.get("excluded", False),
                 local_manifest=local_manifest,
             )
         )

@@ -36,6 +36,18 @@ class GameManifest:
 
 
 @dataclass(frozen=True)
+class SyncMeta:
+    """Lightweight metadata for quick cloud status checks without downloading full manifest."""
+
+    game_id: str
+    hash: str
+    timestamp: datetime
+    compressed: bool = False
+    archive_name: str = ""
+    total_size: int = 0
+
+
+@dataclass(frozen=True)
 class Game:
     id: str
     name: str
@@ -44,5 +56,6 @@ class Game:
     wine_user: str | None = None
     save_paths: tuple[str, ...] = ()
     status: SyncStatus = SyncStatus.UNKNOWN
+    excluded: bool = False
     local_manifest: GameManifest | None = None
     cloud_manifest: GameManifest | None = None

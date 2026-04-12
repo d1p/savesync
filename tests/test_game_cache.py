@@ -51,3 +51,14 @@ def test_load_attaches_local_manifest(tmp_path: Path) -> None:
 def test_load_handles_corrupt_cache(tmp_path: Path) -> None:
     (tmp_path / "game_cache.json").write_text("not json", encoding="utf-8")
     assert load_games(tmp_path) == []
+
+
+def test_save_and_load_preserves_excluded(tmp_path: Path) -> None:
+    games = [
+        Game(id="GameA", name="Game A", excluded=True),
+        Game(id="GameB", name="Game B", excluded=False),
+    ]
+    save_games(games, tmp_path)
+    loaded = load_games(tmp_path)
+    assert loaded[0].excluded is True
+    assert loaded[1].excluded is False

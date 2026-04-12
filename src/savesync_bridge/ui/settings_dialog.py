@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -13,6 +15,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -27,6 +30,60 @@ from savesync_bridge.core.config import (
     save_config,
 )
 from savesync_bridge.ui.workers import DriveConfigWorker
+
+
+class AuthUrlDialog(QDialog):
+    """Non-modal dialog showing the OAuth URL with copy and open-browser buttons."""
+
+    def __init__(self, url: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Google Drive Sign-In")
+        self.setMinimumWidth(540)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(18, 18, 18, 18)
+
+        info = QLabel(
+            "Copy the URL below and open it in your browser to sign in to Google Drive.\n"
+            "Once you complete the sign-in, this dialog will close automatically."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #cdd6f4; font-size: 10pt;")
+        layout.addWidget(info)
+
+        self._url_box = QTextEdit()
+        self._url_box.setPlainText(url)
+        self._url_box.setReadOnly(True)
+        self._url_box.setStyleSheet(
+            "QTextEdit { background-color: #1e1e2e; color: #89b4fa; border: 1px solid #45475a;"
+            " border-radius: 6px; padding: 8px; font-size: 10pt; }"
+        )
+        self._url_box.setFixedHeight(80)
+        self._url_box.selectAll()
+        layout.addWidget(self._url_box)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        copy_btn = QPushButton("Copy URL")
+        copy_btn.setObjectName("accent_btn")
+        copy_btn.clicked.connect(lambda: self._copy_url(url))
+        btn_row.addWidget(copy_btn)
+
+        open_btn = QPushButton("Open in Browser")
+        open_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(url)))
+        btn_row.addWidget(open_btn)
+
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+    def _copy_url(self, url: str) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        clipboard = QApplication.clipboard()
+        if clipboard:
+            clipboard.setText(url)
 
 
 class SettingsDialog(QDialog):
@@ -217,18 +274,31 @@ class SettingsDialog(QDialog):
             return
 
         self._set_busy(True, action)
+        self._auth_url_dialog: AuthUrlDialog | None = None
         self._worker = DriveConfigWorker(action, cfg, self._rclone_config_file, parent=self)
         self._worker.completed.connect(self._on_drive_action_complete)
         self._worker.error.connect(self._on_drive_action_error)
+        self._worker.auth_url_ready.connect(self._on_auth_url_ready)
         self._worker.finished.connect(lambda: self._set_busy(False, action))
         self._worker.start()
 
+    def _on_auth_url_ready(self, url: str) -> None:
+        self._auth_url_dialog = AuthUrlDialog(url, parent=self)
+        self._auth_url_dialog.show()
+
+    def _close_auth_url_dialog(self) -> None:
+        if self._auth_url_dialog is not None:
+            self._auth_url_dialog.close()
+            self._auth_url_dialog = None
+
     def _on_drive_action_complete(self, action: str, message: str) -> None:
+        self._close_auth_url_dialog()
         self._drive_verified = action in {"authenticate", "reconnect", "verify"}
         self._update_connection_status(status_override=message)
         QMessageBox.information(self, "Google Drive", message)
 
     def _on_drive_action_error(self, message: str) -> None:
+        self._close_auth_url_dialog()
         self._drive_verified = False
         self._update_connection_status(status_override=message, is_error=True)
         QMessageBox.warning(self, "Google Drive", message)

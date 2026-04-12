@@ -181,3 +181,13 @@ def test_game_is_frozen() -> None:
 def test_game_save_paths_is_tuple() -> None:
     g = Game(id="x", name="X", save_paths=("%APPDATA%/X",))
     assert isinstance(g.save_paths, tuple)
+
+
+def test_game_excluded_default_false() -> None:
+    g = Game(id="x", name="X")
+    assert g.excluded is False
+
+
+def test_game_excluded_true() -> None:
+    g = Game(id="x", name="X", excluded=True)
+    assert g.excluded is True

@@ -121,43 +121,39 @@ def test_status_badge_all_statuses(qtbot):
 # ---------------------------------------------------------------------------
 
 
-def test_game_card_push_signal(qtbot, sample_game):
-    """Clicking Push emits push_requested with the correct game_id."""
+def test_game_card_sync_signal(qtbot, sample_game):
+    """Clicking Sync emits sync_requested with the correct game_id."""
     card = GameCard(sample_game)
     qtbot.addWidget(card)
 
     emitted: list[str] = []
-    card.push_requested.connect(emitted.append)
+    card.sync_requested.connect(emitted.append)
 
-    qtbot.mouseClick(card._push_btn, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(card._sync_btn, Qt.MouseButton.LeftButton)
 
     assert emitted == ["game1"]
 
 
-def test_game_card_pull_signal(qtbot, sample_game):
-    """Clicking Pull emits pull_requested with the correct game_id."""
+def test_game_card_exclude_signal(qtbot, sample_game):
+    """Toggling the exclude checkbox emits exclude_toggled with game_id and state."""
     card = GameCard(sample_game)
     qtbot.addWidget(card)
 
-    emitted: list[str] = []
-    card.pull_requested.connect(emitted.append)
+    emitted: list[tuple[str, bool]] = []
+    card.exclude_toggled.connect(lambda gid, excluded: emitted.append((gid, excluded)))
 
-    qtbot.mouseClick(card._pull_btn, Qt.MouseButton.LeftButton)
+    card._exclude_cb.setChecked(True)
 
-    assert emitted == ["game1"]
+    assert emitted == [("game1", True)]
 
 
-def test_game_card_details_signal(qtbot, sample_game):
-    """Clicking Details emits details_requested with the correct game_id."""
-    card = GameCard(sample_game)
+def test_game_card_exclude_disables_sync(qtbot):
+    """When excluded, the sync button is disabled."""
+    game = Game(id="game1", name="Test Game", status=SyncStatus.SYNCED, excluded=True)
+    card = GameCard(game)
     qtbot.addWidget(card)
 
-    emitted: list[str] = []
-    card.details_requested.connect(emitted.append)
-
-    qtbot.mouseClick(card._details_btn, Qt.MouseButton.LeftButton)
-
-    assert emitted == ["game1"]
+    assert not card._sync_btn.isEnabled()
 
 
 def test_game_card_update_game_name(qtbot, sample_game):

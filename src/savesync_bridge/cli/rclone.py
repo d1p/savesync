@@ -5,10 +5,12 @@ import configparser
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable
 
 from savesync_bridge.core.binaries import resolve_rclone
 from savesync_bridge.core.exceptions import RcloneError
@@ -133,6 +135,82 @@ def _invoke(
         check=False,
         env=_merged_env(env),
     )
+
+
+_AUTH_URL_RE = re.compile(r"https?://\S+")
+
+
+def _invoke_auth(
+    args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    binary: Path | None = None,
+    config_file: Path | None = None,
+    on_auth_url: Callable[[str], None] | None = None,
+) -> subprocess.CompletedProcess:  # type: ignore[type-arg]
+    """Run an rclone auth command with ``--no-browser``, streaming stderr to
+    detect the OAuth URL and forward it via *on_auth_url*."""
+    if binary is None:
+        binary = resolve_rclone()
+    cmd = [str(binary), *_config_args(config_file), "--no-browser", *args]
+
+    try:
+        from savesync_bridge.core.cli_bus import cli_bus
+        cli_bus.command_run.emit(" ".join(str(c) for c in cmd))
+    except Exception:
+        pass
+
+    merged = _merged_env(env)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=merged,
+    )
+    _active_processes.append(proc)
+
+    stderr_lines: list[str] = []
+    url_emitted = False
+    try:
+        assert proc.stderr is not None  # for type-checker
+        for line in proc.stderr:
+            line = line.rstrip("\n")
+            stderr_lines.append(line)
+            try:
+                from savesync_bridge.core.cli_bus import cli_bus
+                if line.strip():
+                    cli_bus.stderr_line.emit(line.strip())
+            except Exception:
+                pass
+            if not url_emitted and on_auth_url:
+                m = _AUTH_URL_RE.search(line)
+                if m:
+                    on_auth_url(m.group(0))
+                    url_emitted = True
+        proc.wait()
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        try:
+            _active_processes.remove(proc)
+        except ValueError:
+            pass
+
+    stdout = proc.stdout.read() if proc.stdout else ""
+    stderr_text = "\n".join(stderr_lines)
+
+    result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr_text)
+    try:
+        from savesync_bridge.core.cli_bus import cli_bus
+        if result.stdout and result.stdout.strip():
+            cli_bus.stdout_line.emit(result.stdout.strip())
+        cli_bus.exit_code.emit(result.returncode)
+    except Exception:
+        pass
+    return result
 
 
 def has_remote_config(remote: str, config_file: Path | None) -> bool:
@@ -275,6 +353,7 @@ def configure_google_drive_remote(
     client_secret: str | None = None,
     env: dict[str, str] | None = None,
     binary: Path | None = None,
+    on_auth_url: Callable[[str], None] | None = None,
 ) -> None:
     """Create or update a Google Drive remote and save its OAuth token."""
     _free_auth_port()
@@ -303,7 +382,7 @@ def configure_google_drive_remote(
         ]
     )
 
-    result = _invoke(args, env=env, binary=binary, config_file=config_file)
+    result = _invoke_auth(args, env=env, binary=binary, config_file=config_file, on_auth_url=on_auth_url)
     if result.returncode != 0:
         raise RcloneError(
             f"Google Drive authentication failed: {result.stderr}",
@@ -317,14 +396,16 @@ def reconnect_google_drive_remote(
     config_file: Path,
     env: dict[str, str] | None = None,
     binary: Path | None = None,
+    on_auth_url: Callable[[str], None] | None = None,
 ) -> None:
     """Re-run the OAuth flow for an existing Google Drive remote."""
     _free_auth_port()
-    result = _invoke(
+    result = _invoke_auth(
         ["config", "reconnect", f"{remote}:"],
         env=env,
         binary=binary,
         config_file=config_file,
+        on_auth_url=on_auth_url,
     )
     if result.returncode != 0:
         raise RcloneError(

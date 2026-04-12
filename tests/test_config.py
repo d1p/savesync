@@ -22,6 +22,7 @@ def test_app_config_defaults() -> None:
     assert cfg.ludusavi_path is None
     assert cfg.rclone_path is None
     assert cfg.known_games == []
+    assert cfg.excluded_games == []
 
 
 def test_app_config_fields_mutable() -> None:
@@ -61,6 +62,13 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
     assert restored.drive_client_id == "client-123"
     assert restored.drive_client_secret == "secret-456"
     assert restored.known_games == ["Celeste", "Hades"]
+
+
+def test_save_and_load_excluded_games_round_trip(tmp_path: Path) -> None:
+    cfg = AppConfig(excluded_games=["Hades", "Celeste"])
+    save_config(cfg, config_dir=tmp_path)
+    restored = load_config(config_dir=tmp_path)
+    assert restored.excluded_games == ["Hades", "Celeste"]
 
 
 def test_load_config_migrates_legacy_remote_fields(tmp_path: Path) -> None:

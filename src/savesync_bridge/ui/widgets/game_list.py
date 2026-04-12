@@ -17,9 +17,8 @@ from savesync_bridge.ui.widgets.game_card import GameCard
 class GameListWidget(QWidget):
     """Scrollable list of GameCard widgets with search and status filter."""
 
-    push_requested = Signal(str)
-    pull_requested = Signal(str)
-    details_requested = Signal(str)
+    sync_requested = Signal(str)
+    exclude_toggled = Signal(str, bool)  # game_id, excluded
 
     def __init__(self, parent: object = None) -> None:
         super().__init__(parent)
@@ -106,9 +105,8 @@ class GameListWidget(QWidget):
 
         for game in games:
             card = GameCard(game)
-            card.push_requested.connect(self.push_requested)
-            card.pull_requested.connect(self.pull_requested)
-            card.details_requested.connect(self.details_requested)
+            card.sync_requested.connect(self.sync_requested)
+            card.exclude_toggled.connect(self.exclude_toggled)
             self._layout.addWidget(card)
             self._cards[game.id] = card
             self._games[game.id] = game
@@ -123,8 +121,8 @@ class GameListWidget(QWidget):
             self._games[game.id] = game
             self._apply_filter()
 
-    def set_filter(self, filter_status: SyncStatus | None) -> None:
-        """Show only cards matching *filter_status*; ``None`` shows all."""
+    def set_filter(self, filter_status: SyncStatus | None | str) -> None:
+        """Show only cards matching *filter_status*; ``None`` shows all. ``"excluded"`` shows excluded."""
         self._filter = filter_status
         self._apply_filter()
 
@@ -137,7 +135,10 @@ class GameListWidget(QWidget):
         for game_id, card in self._cards.items():
             game = self._games[game_id]
             show = True
-            if self._filter is not None and game.status != self._filter:
+            if self._filter == "excluded":
+                if not game.excluded:
+                    show = False
+            elif self._filter is not None and game.status != self._filter:
                 show = False
             if self._search_text and self._search_text not in game.name.lower():
                 show = False

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncStatus
+from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncMeta, SyncStatus
 
 
 def to_json(manifest: GameManifest) -> str:
@@ -90,4 +90,47 @@ def compare(local: GameManifest, cloud: GameManifest) -> SyncStatus:
     if cloud.timestamp > local.timestamp:
         return SyncStatus.CLOUD_NEWER
     # Equal timestamps but different hashes — independent modification
+    return SyncStatus.CONFLICT
+
+
+# ---------------------------------------------------------------------------
+# SyncMeta — lightweight metadata for quick cloud checks
+# ---------------------------------------------------------------------------
+
+
+def sync_meta_to_json(meta: SyncMeta) -> str:
+    """Serialise a SyncMeta to a JSON string."""
+    data: dict = {
+        "version": 2,
+        "game_id": meta.game_id,
+        "hash": meta.hash,
+        "timestamp": meta.timestamp.isoformat(),
+        "compressed": meta.compressed,
+        "archive_name": meta.archive_name,
+        "total_size": meta.total_size,
+    }
+    return json.dumps(data, indent=2)
+
+
+def sync_meta_from_json(data: str) -> SyncMeta:
+    """Deserialise a SyncMeta from a JSON string."""
+    obj = json.loads(data)
+    return SyncMeta(
+        game_id=obj["game_id"],
+        hash=obj["hash"],
+        timestamp=datetime.fromisoformat(obj["timestamp"]),
+        compressed=obj.get("compressed", False),
+        archive_name=obj.get("archive_name", ""),
+        total_size=obj.get("total_size", 0),
+    )
+
+
+def compare_meta(local: GameManifest, cloud_meta: SyncMeta) -> SyncStatus:
+    """Compare a local manifest with a lightweight cloud SyncMeta."""
+    if local.hash == cloud_meta.hash:
+        return SyncStatus.SYNCED
+    if local.timestamp > cloud_meta.timestamp:
+        return SyncStatus.LOCAL_NEWER
+    if cloud_meta.timestamp > local.timestamp:
+        return SyncStatus.CLOUD_NEWER
     return SyncStatus.CONFLICT

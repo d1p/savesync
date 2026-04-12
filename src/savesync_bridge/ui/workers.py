@@ -37,6 +37,7 @@ class SyncWorker(QThread):
 
     game_updated = Signal(str, object)  # game_id, SyncResult
     conflict_detected = Signal(str, object, object)  # game_id, local_manifest, cloud_manifest
+    progress = Signal(int, int)  # done, total
     finished = Signal()
     error = Signal(str)
 
@@ -53,6 +54,9 @@ class SyncWorker(QThread):
         self._target_wine_contexts = target_wine_contexts or {}
 
     def run(self) -> None:
+        total = len(self._game_ids)
+        done = 0
+        self.progress.emit(0, total)
         try:
             for game_id in self._game_ids:
                 target_wine_prefix, target_wine_user = self._target_wine_contexts.get(
@@ -64,12 +68,14 @@ class SyncWorker(QThread):
                     target_wine_prefix=target_wine_prefix,
                     target_wine_user=target_wine_user,
                 )
+                done += 1
                 if result.status == SyncStatus.CONFLICT:
                     local = self._engine.get_local_manifest(game_id)
                     cloud = self._engine.get_cloud_manifest(game_id)
                     self.conflict_detected.emit(game_id, local, cloud)
                 else:
                     self.game_updated.emit(game_id, result)
+                self.progress.emit(done, total)
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
@@ -191,6 +197,7 @@ class DriveConfigWorker(QThread):
 
     completed = Signal(str, str)  # action, message
     error = Signal(str)
+    auth_url_ready = Signal(str)  # OAuth URL for manual browser opening
 
     def __init__(
         self,
@@ -215,6 +222,7 @@ class DriveConfigWorker(QThread):
                     client_id=self._config.drive_client_id,
                     client_secret=self._config.drive_client_secret,
                     binary=binary,
+                    on_auth_url=self.auth_url_ready.emit,
                 )
                 self.completed.emit(
                     self._action,
@@ -227,6 +235,7 @@ class DriveConfigWorker(QThread):
                     self._config.drive_remote,
                     self._rclone_config_file,
                     binary=binary,
+                    on_auth_url=self.auth_url_ready.emit,
                 )
                 self.completed.emit(self._action, "Google Drive token refreshed.")
                 return

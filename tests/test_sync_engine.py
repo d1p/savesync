@@ -10,7 +10,7 @@ from savesync_bridge.core import manifest as manifest_module
 from savesync_bridge.core.config import AppConfig
 from savesync_bridge.core.exceptions import LudusaviError, RcloneError
 from savesync_bridge.core.sync_engine import SyncEngine, SyncResult
-from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncStatus
+from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncMeta, SyncStatus
 
 GAME_ID = "Hades"
 
@@ -121,15 +121,15 @@ class TestPush:
         # game_name is first positional arg
         assert call_args[0][0] == GAME_ID
 
-    def test_calls_rclone_upload_twice(self, engine: SyncEngine) -> None:
-        """Should upload game files dir AND manifest.json separately."""
+    def test_calls_rclone_upload_three_times(self, engine: SyncEngine) -> None:
+        """Should upload archive, manifest.json, and sync_meta.json."""
         with (
             patch("savesync_bridge.core.sync_engine.ludusavi") as mock_lud,
             patch("savesync_bridge.core.sync_engine.rclone") as mock_rcl,
         ):
             mock_lud.backup_game.return_value = Path("/tmp/staging/Hades")
             engine.push(GAME_ID)
-        assert mock_rcl.upload.call_count == 2
+        assert mock_rcl.upload.call_count == 3
 
     def test_saves_local_manifest_after_push(self, engine: SyncEngine, tmp_path: Path) -> None:
         with (
@@ -175,6 +175,7 @@ class TestPull:
         with (
             patch("savesync_bridge.core.sync_engine.ludusavi"),
             patch("savesync_bridge.core.sync_engine.rclone"),
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
         ):
             result = engine.pull(GAME_ID, m)
         assert result.game_id == GAME_ID
@@ -186,6 +187,7 @@ class TestPull:
         with (
             patch("savesync_bridge.core.sync_engine.ludusavi"),
             patch("savesync_bridge.core.sync_engine.rclone") as mock_rcl,
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
         ):
             engine.pull(GAME_ID, m)
         mock_rcl.download.assert_called_once()
@@ -195,6 +197,7 @@ class TestPull:
         with (
             patch("savesync_bridge.core.sync_engine.ludusavi") as mock_lud,
             patch("savesync_bridge.core.sync_engine.rclone"),
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
         ):
             engine.pull(GAME_ID, m)
         mock_lud.restore_game.assert_called_once()
@@ -209,6 +212,7 @@ class TestPull:
             patch(
                 "savesync_bridge.core.sync_engine.convert_simple_backup_for_restore"
             ) as mock_convert,
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
         ):
             engine.pull(
                 GAME_ID,
@@ -227,6 +231,7 @@ class TestPull:
         with (
             patch("savesync_bridge.core.sync_engine.ludusavi"),
             patch("savesync_bridge.core.sync_engine.rclone"),
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
         ):
             engine.pull(GAME_ID, m)
         state_file = tmp_path / "states" / f"{GAME_ID}.json"
@@ -239,6 +244,7 @@ class TestPull:
         with (
             patch("savesync_bridge.core.sync_engine.ludusavi"),
             patch("savesync_bridge.core.sync_engine.rclone") as mock_rcl,
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
         ):
             mock_rcl.download.side_effect = RcloneError("download failed", 1, "")
             result = engine.pull(GAME_ID, m)
@@ -250,6 +256,7 @@ class TestPull:
         with (
             patch("savesync_bridge.core.sync_engine.ludusavi") as mock_lud,
             patch("savesync_bridge.core.sync_engine.rclone"),
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
         ):
             mock_lud.restore_game.side_effect = LudusaviError("restore failed", 1, "")
             result = engine.pull(GAME_ID, m)
@@ -271,25 +278,37 @@ class TestCheckStatus:
     def test_synced_when_hashes_match(self, engine: SyncEngine) -> None:
         m = _make_manifest()
         self._write_local(engine, m)
-        with patch.object(engine, "get_cloud_manifest", return_value=m):
+        with (
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
+            patch.object(engine, "get_cloud_manifest", return_value=m),
+        ):
             result = engine.check_status(GAME_ID)
         assert result.status == SyncStatus.SYNCED
 
     def test_local_newer_when_no_cloud(self, engine: SyncEngine) -> None:
         m = _make_manifest()
         self._write_local(engine, m)
-        with patch.object(engine, "get_cloud_manifest", return_value=None):
+        with (
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
+            patch.object(engine, "get_cloud_manifest", return_value=None),
+        ):
             result = engine.check_status(GAME_ID)
         assert result.status == SyncStatus.LOCAL_NEWER
 
     def test_cloud_newer_when_no_local(self, engine: SyncEngine) -> None:
         m = _make_manifest()
-        with patch.object(engine, "get_cloud_manifest", return_value=m):
+        with (
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
+            patch.object(engine, "get_cloud_manifest", return_value=m),
+        ):
             result = engine.check_status(GAME_ID)
         assert result.status == SyncStatus.CLOUD_NEWER
 
     def test_unknown_when_neither_local_nor_cloud(self, engine: SyncEngine) -> None:
-        with patch.object(engine, "get_cloud_manifest", return_value=None):
+        with (
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
+            patch.object(engine, "get_cloud_manifest", return_value=None),
+        ):
             result = engine.check_status(GAME_ID)
         assert result.status == SyncStatus.UNKNOWN
 
@@ -300,7 +319,10 @@ class TestCheckStatus:
             content_hash="sha256:different",
         )
         self._write_local(engine, local)
-        with patch.object(engine, "get_cloud_manifest", return_value=cloud):
+        with (
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
+            patch.object(engine, "get_cloud_manifest", return_value=cloud),
+        ):
             result = engine.check_status(GAME_ID)
         assert result.status == SyncStatus.LOCAL_NEWER
 
@@ -314,9 +336,32 @@ class TestCheckStatus:
             content_hash="sha256:new",
         )
         self._write_local(engine, local)
-        with patch.object(engine, "get_cloud_manifest", return_value=cloud):
+        with (
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
+            patch.object(engine, "get_cloud_manifest", return_value=cloud),
+        ):
             result = engine.check_status(GAME_ID)
         assert result.status == SyncStatus.CLOUD_NEWER
+
+    def test_uses_sync_meta_fast_path(self, engine: SyncEngine) -> None:
+        """check_status should use sync_meta when available, skipping full manifest fetch."""
+        local = _make_manifest(content_hash="sha256:same")
+        self._write_local(engine, local)
+        cloud_meta = SyncMeta(
+            game_id=GAME_ID,
+            hash="sha256:same",
+            timestamp=local.timestamp,
+            compressed=True,
+            archive_name="save.tar.gz",
+            total_size=1024,
+        )
+        with (
+            patch.object(engine, "_get_cloud_sync_meta", return_value=cloud_meta),
+            patch.object(engine, "get_cloud_manifest") as mock_full,
+        ):
+            result = engine.check_status(GAME_ID)
+        assert result.status == SyncStatus.SYNCED
+        mock_full.assert_not_called()  # should NOT fall back to full manifest
 
 
 # ---------------------------------------------------------------------------
