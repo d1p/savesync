@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import configparser
 import json
+import logging
 import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -96,6 +98,122 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
+_RCLONE_AUTH_PORT = 53682
+_log = logging.getLogger(__name__)
+
+
+def _free_auth_port() -> None:
+    """Kill stale rclone processes holding the OAuth callback port.
+
+    Rclone hardcodes port 53682 for its OAuth redirect server.  On Steam Deck
+    (and Flatpak environments in general) a previous auth attempt may leave a
+    zombie rclone process bound to that port.  This helper detects and kills it
+    so the next auth attempt can succeed.
+    """
+    import socket
+
+    # Quick check: is the port actually in use?
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", _RCLONE_AUTH_PORT))
+            return  # Port is free, nothing to do.
+        except OSError:
+            pass
+
+    _log.info("Auth port %d is in use, searching for stale rclone processes…", _RCLONE_AUTH_PORT)
+
+    # Try host-level ss via flatpak-spawn (Steam Deck / Flatpak).
+    pid = _find_port_owner_flatpak()
+    if pid is None:
+        # Fallback: try inside the sandbox / native Linux.
+        pid = _find_port_owner_proc()
+
+    if pid is None:
+        _log.warning(
+            "Port %d is occupied but the owning process could not be found.",
+            _RCLONE_AUTH_PORT,
+        )
+        return
+
+    _log.info("Killing stale rclone process (PID %d) on port %d.", pid, _RCLONE_AUTH_PORT)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass  # Already gone.
+    except PermissionError:
+        # Inside Flatpak we may not be able to kill host processes directly;
+        # fall back to flatpak-spawn.
+        try:
+            subprocess.run(
+                ["flatpak-spawn", "--host", "kill", str(pid)],
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            _log.warning("Could not kill PID %d – auth may fail.", pid)
+
+
+def _find_port_owner_flatpak() -> int | None:
+    """Use flatpak-spawn + ss on the host to find the PID owning the auth port."""
+    try:
+        result = subprocess.run(
+            ["flatpak-spawn", "--host", "ss", "-tlnp",
+             f"sport = :{_RCLONE_AUTH_PORT}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        # Example output line:
+        # LISTEN 0 4096 127.0.0.1:53682 0.0.0.0:* users:(("rclone",pid=85719,fd=6))
+        for line in result.stdout.splitlines():
+            if "rclone" in line and f":{_RCLONE_AUTH_PORT}" in line:
+                import re
+                m = re.search(r"pid=(\d+)", line)
+                if m:
+                    return int(m.group(1))
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _find_port_owner_proc() -> int | None:
+    """Parse /proc/net/tcp to find the PID owning the auth port (native Linux)."""
+    hex_port = f"{_RCLONE_AUTH_PORT:04X}"
+    try:
+        with open("/proc/net/tcp", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 10:
+                    continue
+                local = parts[1]
+                if local.endswith(f":{hex_port}") and parts[3] == "0A":  # LISTEN
+                    inode = parts[9]
+                    return _pid_for_inode(inode)
+    except OSError:
+        pass
+    return None
+
+
+def _pid_for_inode(inode: str) -> int | None:
+    """Walk /proc/*/fd to find the process owning a socket inode."""
+    target = f"socket:[{inode}]"
+    proc = Path("/proc")
+    for pid_dir in proc.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        fd_dir = pid_dir / "fd"
+        try:
+            for fd in fd_dir.iterdir():
+                try:
+                    if os.readlink(str(fd)) == target:
+                        return int(pid_dir.name)
+                except OSError:
+                    continue
+        except (PermissionError, OSError):
+            continue
+    return None
+
+
 def configure_google_drive_remote(
     remote: str,
     config_file: Path,
@@ -105,6 +223,7 @@ def configure_google_drive_remote(
     binary: Path | None = None,
 ) -> None:
     """Create or update a Google Drive remote and save its OAuth token."""
+    _free_auth_port()
     port = _find_free_port()
     args = [
         "config",
@@ -146,6 +265,7 @@ def reconnect_google_drive_remote(
     binary: Path | None = None,
 ) -> None:
     """Re-run the OAuth flow for an existing Google Drive remote."""
+    _free_auth_port()
     result = _invoke(
         ["config", "reconnect", f"{remote}:"],
         env=env,
