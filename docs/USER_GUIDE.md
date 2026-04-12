@@ -9,7 +9,7 @@ The app makes decisions at the game level, not at the individual-file level. Whe
 SaveSync-Bridge combines three things:
 
 - Ludusavi discovers save files and performs backup and restore operations.
-- rclone uploads and downloads those backup files to S3-compatible storage.
+- rclone uploads and downloads those backup files to cloud storage such as Google Drive or S3-compatible remotes.
 - SaveSync-Bridge stores a local manifest per game so it can decide whether your local copy or the cloud copy should win.
 
 ## Core Model
@@ -26,7 +26,7 @@ For each game, the app tracks one of these states:
 
 ## 1. Configure credentials
 
-The app loads `.env` from the current working directory on startup. Typical keys are:
+The app loads `.env` from the current working directory on startup. For Google Drive remotes already configured in rclone, you may not need any extra environment variables. Typical S3 keys are:
 
 ```env
 RCLONE_CONFIG_S3_TYPE=s3
@@ -37,15 +37,16 @@ RCLONE_CONFIG_S3_REGION=...
 RCLONE_CONFIG_S3_ENDPOINT=...
 ```
 
-If your rclone remote is fully configured elsewhere, you may not need all of these variables.
+If your rclone remote is fully configured elsewhere, you may not need any of these variables.
 
 ## 2. Configure app settings
 
 Open `Settings` in the app and fill in:
 
-- `rclone Remote Name`: the remote name rclone should use, such as `s3remote`
-- `S3 Bucket`: your target bucket
-- `S3 Prefix / Path`: top-level folder used by SaveSync-Bridge inside the bucket
+- `Cloud Provider`: choose `Google Drive` or `S3 Compatible`. New installs default to `Google Drive`.
+- `rclone Remote Name`: the remote name rclone should use, such as `gdrive` or `s3remote`
+- `Drive Root Folder` or `S3 Bucket`: optional top-level container. Leave it empty for a normal Google Drive remote rooted at My Drive.
+- `Drive Folder Prefix` or `S3 Prefix / Path`: top-level folder used by SaveSync-Bridge inside the selected remote
 - `Ludusavi Binary`: optional override; leave empty to use the bundled binary
 - `Rclone Binary`: optional override; leave empty to use the bundled binary
 
@@ -194,13 +195,13 @@ The bottom debug console shows:
 Use it when:
 
 - a game does not appear during refresh
-- credentials or bucket settings are wrong
+- credentials or remote path settings are wrong
 - Ludusavi cannot restore or back up a title
 - you need to see the exact CLI behavior
 
 ## Cloud Layout
 
-Within your configured bucket and prefix, each game is stored under:
+Within your configured remote path, each game is stored under:
 
 ```text
 <s3_prefix>/<game_id>/

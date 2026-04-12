@@ -7,7 +7,7 @@ import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QPushButton
 
-from savesync_bridge.core.config import AppConfig
+from savesync_bridge.core.config import RCLONE_BACKEND_S3, AppConfig
 from savesync_bridge.models.game import Game, GameManifest, Platform, SaveFile, SyncStatus
 from savesync_bridge.ui.conflict_dialog import ConflictDialog
 from savesync_bridge.ui.settings_dialog import SettingsDialog
@@ -63,6 +63,7 @@ def cloud_manifest() -> GameManifest:
 @pytest.fixture()
 def sample_config() -> AppConfig:
     return AppConfig(
+        rclone_backend=RCLONE_BACKEND_S3,
         rclone_remote="myremote",
         s3_bucket="mybucket",
         s3_prefix="myprefix",
@@ -333,6 +334,7 @@ def test_settings_dialog_populates_from_config(qtbot, sample_config):
     dlg = SettingsDialog(sample_config)
     qtbot.addWidget(dlg)
 
+    assert dlg._backend.currentData() == RCLONE_BACKEND_S3
     assert dlg._rclone_remote.text() == "myremote"
     assert dlg._s3_bucket.text() == "mybucket"
     assert dlg._s3_prefix.text() == "myprefix"
@@ -350,9 +352,32 @@ def test_settings_dialog_get_config_returns_current_values(qtbot, sample_config)
 
     cfg = dlg.get_config()
 
+    assert cfg.rclone_backend == RCLONE_BACKEND_S3
     assert cfg.s3_bucket == "new-bucket"
     assert cfg.rclone_remote == "other-remote"
     assert cfg.s3_prefix == "myprefix"  # unchanged
+
+
+def test_settings_dialog_defaults_to_google_drive(qtbot):
+    """A default config opens with Google Drive selected and gdrive prefilled."""
+    dlg = SettingsDialog(AppConfig())
+    qtbot.addWidget(dlg)
+
+    assert dlg._backend.currentData() == "google_drive"
+    assert dlg._rclone_remote.text() == "gdrive"
+    assert dlg._s3_bucket_label.text() == "Drive Root Folder:"
+
+
+def test_settings_dialog_switching_to_google_drive_updates_default_remote(qtbot, sample_config):
+    """Switching providers swaps built-in default remote names."""
+    dlg = SettingsDialog(sample_config)
+    qtbot.addWidget(dlg)
+
+    dlg._rclone_remote.setText("s3remote")
+    dlg._backend.setCurrentIndex(dlg._backend.findData("google_drive"))
+
+    assert dlg._rclone_remote.text() == "gdrive"
+    assert dlg._s3_bucket_label.text() == "Drive Root Folder:"
 
 
 def test_settings_dialog_empty_paths_become_none(qtbot, sample_config):

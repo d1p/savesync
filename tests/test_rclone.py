@@ -92,6 +92,13 @@ class TestUpload:
         # When no env override, subprocess inherits from parent (env kwarg absent or None)
         assert kwargs.get("env") is None
 
+    def test_omits_bucket_when_empty(self, tmp_path: Path) -> None:
+        proc = _make_proc()
+        with patch("subprocess.run", return_value=proc) as mock_run:
+            upload(tmp_path, "gdrive", "", PREFIX, binary=FAKE_BINARY)
+        args = mock_run.call_args[0][0]
+        assert "gdrive:saves/Hades" in args
+
 
 class TestDownload:
     def test_cli_args(self, tmp_path: Path) -> None:
@@ -127,6 +134,13 @@ class TestDownload:
         kwargs = mock_run.call_args[1]
         assert kwargs.get("shell", False) is False
 
+    def test_omits_bucket_when_empty(self, tmp_path: Path) -> None:
+        proc = _make_proc()
+        with patch("subprocess.run", return_value=proc) as mock_run:
+            download("gdrive", "", PREFIX, tmp_path, binary=FAKE_BINARY)
+        args = mock_run.call_args[0][0]
+        assert "gdrive:saves/Hades" in args
+
 
 class TestReadFile:
     def test_returns_stdout_bytes(self) -> None:
@@ -158,6 +172,13 @@ class TestReadFile:
             rclone_read_file(REMOTE, BUCKET, "key", binary=FAKE_BINARY)
         kwargs = mock_run.call_args[1]
         assert kwargs.get("shell", False) is False
+
+    def test_omits_bucket_when_empty(self) -> None:
+        proc = _make_proc(stdout=b"data")
+        with patch("subprocess.run", return_value=proc) as mock_run:
+            rclone_read_file("gdrive", "", "saves/Hades/manifest.json", binary=FAKE_BINARY)
+        args = mock_run.call_args[0][0]
+        assert "gdrive:saves/Hades/manifest.json" in args
 
 
 class TestListFiles:
@@ -195,6 +216,13 @@ class TestListFiles:
         with patch("subprocess.run", return_value=proc):
             with pytest.raises(RcloneError):
                 list_files(REMOTE, BUCKET, PREFIX, binary=FAKE_BINARY)
+
+    def test_omits_bucket_when_empty(self) -> None:
+        proc = _make_proc(stdout="[]")
+        with patch("subprocess.run", return_value=proc) as mock_run:
+            list_files("gdrive", "", PREFIX, binary=FAKE_BINARY)
+        args = mock_run.call_args[0][0]
+        assert "gdrive:saves/Hades" in args
 
 
 class TestFileExists:

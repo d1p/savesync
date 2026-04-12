@@ -44,6 +44,13 @@ def _merged_env(extra: dict[str, str] | None) -> dict[str, str] | None:
     return merged
 
 
+def _remote_target(remote: str, bucket: str, prefix: str) -> str:
+    parts = [segment.strip("/") for segment in (bucket, prefix) if segment.strip("/")]
+    if not parts:
+        return f"{remote}:"
+    return f"{remote}:{'/'.join(parts)}"
+
+
 def upload(
     local_path: Path,
     remote: str,
@@ -52,13 +59,13 @@ def upload(
     env: dict[str, str] | None = None,
     binary: Path | None = None,
 ) -> None:
-    """Run ``rclone copy <local_path> <remote>:<bucket>/<prefix>``.
+    """Run ``rclone copy <local_path> <remote-target>``.
 
     Args:
         local_path: Local file or directory to upload.
         remote: Name of the rclone remote (e.g. ``"s3remote"``).
-        bucket: S3 bucket name.
-        prefix: Key prefix / sub-path inside the bucket.
+        bucket: Bucket or top-level folder. Leave empty for root-based remotes.
+        prefix: Key prefix / sub-path inside the remote.
         env: Extra environment variables merged into the subprocess env.
         binary: Path to the rclone binary. Defaults to ``resolve_rclone()``.
 
@@ -67,9 +74,10 @@ def upload(
     """
     if binary is None:
         binary = resolve_rclone()
+    target = _remote_target(remote, bucket, prefix)
 
     result = _run(
-        [str(binary), "copy", str(local_path), f"{remote}:{bucket}/{prefix}"],
+        [str(binary), "copy", str(local_path), target],
         capture_output=True,
         text=True,
         check=False,
@@ -92,12 +100,12 @@ def download(
     env: dict[str, str] | None = None,
     binary: Path | None = None,
 ) -> None:
-    """Run ``rclone copy <remote>:<bucket>/<prefix> <local_path>``.
+    """Run ``rclone copy <remote-target> <local_path>``.
 
     Args:
         remote: Name of the rclone remote.
-        bucket: S3 bucket name.
-        prefix: Key prefix / sub-path inside the bucket.
+        bucket: Bucket or top-level folder. Leave empty for root-based remotes.
+        prefix: Key prefix / sub-path inside the remote.
         local_path: Local destination directory.
         env: Extra environment variables merged into the subprocess env.
         binary: Path to the rclone binary. Defaults to ``resolve_rclone()``.
@@ -107,9 +115,10 @@ def download(
     """
     if binary is None:
         binary = resolve_rclone()
+    target = _remote_target(remote, bucket, prefix)
 
     result = _run(
-        [str(binary), "copy", f"{remote}:{bucket}/{prefix}", str(local_path)],
+        [str(binary), "copy", target, str(local_path)],
         capture_output=True,
         text=True,
         check=False,
@@ -131,12 +140,12 @@ def read_file(
     env: dict[str, str] | None = None,
     binary: Path | None = None,
 ) -> bytes:
-    """Run ``rclone cat <remote>:<bucket>/<key>`` and return raw stdout bytes.
+    """Run ``rclone cat <remote-target>`` and return raw stdout bytes.
 
     Args:
         remote: Name of the rclone remote.
-        bucket: S3 bucket name.
-        key: Full object key within the bucket.
+        bucket: Bucket or top-level folder. Leave empty for root-based remotes.
+        key: Full object key within the remote.
         env: Extra environment variables merged into the subprocess env.
         binary: Path to the rclone binary. Defaults to ``resolve_rclone()``.
 
@@ -148,10 +157,11 @@ def read_file(
     """
     if binary is None:
         binary = resolve_rclone()
+    target = _remote_target(remote, bucket, key)
 
     # Use text=False so stdout is returned as raw bytes — needed for binary saves.
     result = _run(
-        [str(binary), "cat", f"{remote}:{bucket}/{key}"],
+        [str(binary), "cat", target],
         capture_output=True,
         check=False,
         env=_merged_env(env),
@@ -176,12 +186,12 @@ def list_files(
     env: dict[str, str] | None = None,
     binary: Path | None = None,
 ) -> list[dict]:
-    """Run ``rclone lsjson <remote>:<bucket>/<prefix>`` and return parsed JSON.
+    """Run ``rclone lsjson <remote-target>`` and return parsed JSON.
 
     Args:
         remote: Name of the rclone remote.
-        bucket: S3 bucket name.
-        prefix: Key prefix / sub-path inside the bucket.
+        bucket: Bucket or top-level folder. Leave empty for root-based remotes.
+        prefix: Key prefix / sub-path inside the remote.
         env: Extra environment variables merged into the subprocess env.
         binary: Path to the rclone binary. Defaults to ``resolve_rclone()``.
 
@@ -193,9 +203,10 @@ def list_files(
     """
     if binary is None:
         binary = resolve_rclone()
+    target = _remote_target(remote, bucket, prefix)
 
     result = _run(
-        [str(binary), "lsjson", f"{remote}:{bucket}/{prefix}"],
+        [str(binary), "lsjson", target],
         capture_output=True,
         text=True,
         check=False,
@@ -226,12 +237,12 @@ def file_exists(
     env: dict[str, str] | None = None,
     binary: Path | None = None,
 ) -> bool:
-    """Return ``True`` if *key* exists in the remote bucket.
+    """Return ``True`` if *key* exists in the configured cloud target.
 
     Args:
         remote: Name of the rclone remote.
-        bucket: S3 bucket name.
-        key: Full object key within the bucket.
+        bucket: Bucket or top-level folder. Leave empty for root-based remotes.
+        key: Full object key within the remote.
         env: Extra environment variables merged into the subprocess env.
         binary: Path to the rclone binary. Defaults to ``resolve_rclone()``.
 

@@ -269,6 +269,7 @@ Stored as TOML:
 
 Fields:
 
+- `rclone_backend`
 - `rclone_remote`
 - `s3_bucket`
 - `s3_prefix`
@@ -316,10 +317,10 @@ Implemented in `cli/ludusavi.py`.
 
 Implemented in `cli/rclone.py`.
 
-- `upload()` -> `rclone copy <local> <remote>:<bucket>/<prefix>`
-- `download()` -> `rclone copy <remote>:<bucket>/<prefix> <local>`
-- `read_file()` -> `rclone cat <remote>:<bucket>/<key>`
-- `list_files()` -> `rclone lsjson <remote>:<bucket>/<prefix>`
+- `upload()` -> `rclone copy <local> <remote>:<bucket-or-root>/<prefix>`
+- `download()` -> `rclone copy <remote>:<bucket-or-root>/<prefix> <local>`
+- `read_file()` -> `rclone cat <remote>:<bucket-or-root>/<key>`
+- `list_files()` -> `rclone lsjson <remote>:<bucket-or-root>/<prefix>`
 
 The wrapper can merge extra environment variables into the subprocess environment so credentials loaded from `.env` are inherited by rclone.
 

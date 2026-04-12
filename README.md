@@ -1,6 +1,6 @@
 # SaveSync-Bridge
 
-A PySide6 GUI that acts as a smart manager for [Ludusavi](https://github.com/mtkennerly/ludusavi), enabling seamless game save synchronization between Windows PCs and Steam Deck via rclone-backed S3 storage.
+A PySide6 GUI that acts as a smart manager for [Ludusavi](https://github.com/mtkennerly/ludusavi), enabling seamless game save synchronization between Windows PCs and Steam Deck via rclone-backed cloud storage.
 
 ## Documentation
 
@@ -46,13 +46,13 @@ To run an on-demand cloud build without publishing a release, use the `Cloud Bui
 - **Conflict Resolution**: Metadata-driven sync with a visual conflict resolution dialog
 - **Sync Center**: Unified view of all games regardless of which machine they were last played on
 - **Ludusavi Integration**: Uses Ludusavi's `--api` mode for save discovery and backup/restore
-- **rclone Transport**: Leverages rclone CLI for S3 storage operations
+- **rclone Transport**: Leverages rclone CLI for Google Drive and S3-compatible storage operations
 
 ## Requirements
 
 - Python 3.13+
 - [Ludusavi](https://github.com/mtkennerly/ludusavi) CLI installed and on PATH
-- [rclone](https://rclone.org/) CLI installed and configured with your S3 remote
+- [rclone](https://rclone.org/) CLI installed and configured with your preferred remote
 
 ## Setup
 

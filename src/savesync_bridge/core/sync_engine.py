@@ -123,7 +123,7 @@ class SyncEngine:
     # ------------------------------------------------------------------
 
     def get_cloud_manifest(self, game_id: str) -> GameManifest | None:
-        """Fetch manifest.json from S3 for *game_id*. Returns ``None`` if absent.
+        """Fetch manifest.json from cloud storage for *game_id*. Returns ``None`` if absent.
 
         Args:
             game_id: Ludusavi game identifier.
@@ -145,7 +145,7 @@ class SyncEngine:
             return None
 
     def push(self, game_id: str) -> SyncResult:
-        """Back up *game_id* via Ludusavi and upload the result to S3.
+        """Back up *game_id* via Ludusavi and upload the result to cloud storage.
 
         Args:
             game_id: Ludusavi game identifier.
@@ -206,7 +206,7 @@ class SyncEngine:
         target_wine_prefix: str | None = None,
         target_wine_user: str | None = None,
     ) -> SyncResult:
-        """Download saves from S3 and restore them via Ludusavi.
+        """Download saves from cloud storage and restore them via Ludusavi.
 
         Args:
             game_id: Ludusavi game identifier.

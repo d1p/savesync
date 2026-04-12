@@ -4,7 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from savesync_bridge.core.config import AppConfig, load_config, save_config
+from savesync_bridge.core.config import (
+    RCLONE_BACKEND_GOOGLE_DRIVE,
+    RCLONE_BACKEND_S3,
+    AppConfig,
+    load_config,
+    save_config,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -14,7 +20,8 @@ from savesync_bridge.core.config import AppConfig, load_config, save_config
 
 def test_app_config_defaults() -> None:
     cfg = AppConfig()
-    assert cfg.rclone_remote == "s3remote"
+    assert cfg.rclone_backend == RCLONE_BACKEND_GOOGLE_DRIVE
+    assert cfg.rclone_remote == "gdrive"
     assert cfg.s3_bucket == ""
     assert cfg.s3_prefix == "savesync-bridge"
     assert cfg.ludusavi_path is None
@@ -36,7 +43,8 @@ def test_app_config_fields_mutable() -> None:
 def test_load_config_creates_default_when_missing(tmp_path: Path) -> None:
     cfg = load_config(config_dir=tmp_path)
     assert isinstance(cfg, AppConfig)
-    assert cfg.rclone_remote == "s3remote"
+    assert cfg.rclone_backend == RCLONE_BACKEND_GOOGLE_DRIVE
+    assert cfg.rclone_remote == "gdrive"
 
 
 def test_load_config_does_not_raise_on_missing_dir(tmp_path: Path) -> None:
@@ -52,6 +60,7 @@ def test_load_config_does_not_raise_on_missing_dir(tmp_path: Path) -> None:
 
 def test_save_and_load_round_trip(tmp_path: Path) -> None:
     cfg = AppConfig(
+        rclone_backend=RCLONE_BACKEND_S3,
         rclone_remote="r2remote",
         s3_bucket="my-bucket",
         s3_prefix="games/saves",
@@ -60,10 +69,26 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
     save_config(cfg, config_dir=tmp_path)
     restored = load_config(config_dir=tmp_path)
 
+    assert restored.rclone_backend == RCLONE_BACKEND_S3
     assert restored.rclone_remote == "r2remote"
     assert restored.s3_bucket == "my-bucket"
     assert restored.s3_prefix == "games/saves"
     assert restored.known_games == ["Celeste", "Hades"]
+
+
+def test_load_config_infers_s3_backend_for_legacy_bucket_config(tmp_path: Path) -> None:
+    (tmp_path / "config.toml").write_text(
+        'rclone_remote = "legacy-remote"\n'
+        's3_bucket = "legacy-bucket"\n'
+        's3_prefix = "saves"\n'
+        'known_games = []\n',
+        encoding="utf-8",
+    )
+
+    cfg = load_config(config_dir=tmp_path)
+
+    assert cfg.rclone_backend == RCLONE_BACKEND_S3
+    assert cfg.rclone_remote == "legacy-remote"
 
 
 def test_save_creates_config_file(tmp_path: Path) -> None:

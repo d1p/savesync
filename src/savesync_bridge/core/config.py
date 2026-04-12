@@ -7,9 +7,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+RCLONE_BACKEND_GOOGLE_DRIVE = "google_drive"
+RCLONE_BACKEND_S3 = "s3"
+SUPPORTED_RCLONE_BACKENDS = (
+    RCLONE_BACKEND_GOOGLE_DRIVE,
+    RCLONE_BACKEND_S3,
+)
+DEFAULT_RCLONE_REMOTE_BY_BACKEND = {
+    RCLONE_BACKEND_GOOGLE_DRIVE: "gdrive",
+    RCLONE_BACKEND_S3: "s3remote",
+}
+
+
 @dataclass
 class AppConfig:
-    rclone_remote: str = "s3remote"
+    rclone_backend: str = RCLONE_BACKEND_GOOGLE_DRIVE
+    rclone_remote: str = DEFAULT_RCLONE_REMOTE_BY_BACKEND[RCLONE_BACKEND_GOOGLE_DRIVE]
     s3_bucket: str = ""
     s3_prefix: str = "savesync-bridge"
     ludusavi_path: str | None = None
@@ -27,6 +40,14 @@ def _default_config_dir() -> Path:
 
 def _config_file(config_dir: Path) -> Path:
     return config_dir / "config.toml"
+
+
+def _coerce_rclone_backend(raw_value: object, bucket: str) -> str:
+    if isinstance(raw_value, str) and raw_value in SUPPORTED_RCLONE_BACKENDS:
+        return raw_value
+    if bucket.strip():
+        return RCLONE_BACKEND_S3
+    return RCLONE_BACKEND_GOOGLE_DRIVE
 
 
 def load_config(config_dir: Path | None = None) -> AppConfig:
@@ -50,8 +71,12 @@ def load_config(config_dir: Path | None = None) -> AppConfig:
     with cfg_file.open("rb") as fh:
         data = tomllib.load(fh)
 
+    backend = _coerce_rclone_backend(data.get("rclone_backend"), data.get("s3_bucket", ""))
+    default_remote = DEFAULT_RCLONE_REMOTE_BY_BACKEND[backend]
+
     return AppConfig(
-        rclone_remote=data.get("rclone_remote", "s3remote"),
+        rclone_backend=backend,
+        rclone_remote=data.get("rclone_remote", default_remote),
         s3_bucket=data.get("s3_bucket", ""),
         s3_prefix=data.get("s3_prefix", "savesync-bridge"),
         ludusavi_path=data.get("ludusavi_path"),
@@ -94,6 +119,7 @@ def _toml_array_of_str(values: list[str]) -> str:
 
 def _to_toml(cfg: AppConfig) -> str:
     lines: list[str] = [
+        f"rclone_backend = {_toml_str(cfg.rclone_backend)}",
         f"rclone_remote = {_toml_str(cfg.rclone_remote)}",
         f"s3_bucket = {_toml_str(cfg.s3_bucket)}",
         f"s3_prefix = {_toml_str(cfg.s3_prefix)}",

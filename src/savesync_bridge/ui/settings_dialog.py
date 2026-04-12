@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
-from savesync_bridge.core.config import AppConfig
+from savesync_bridge.core.config import (
+    DEFAULT_RCLONE_REMOTE_BY_BACKEND,
+    RCLONE_BACKEND_GOOGLE_DRIVE,
+    RCLONE_BACKEND_S3,
+    AppConfig,
+)
 
 
 class SettingsDialog(QDialog):
@@ -34,14 +41,27 @@ class SettingsDialog(QDialog):
         form.setSpacing(10)
         form.setContentsMargins(0, 0, 0, 0)
 
+        self._backend_label = QLabel("Cloud Provider:")
+        self._backend = QComboBox()
+        self._backend.addItem("Google Drive", RCLONE_BACKEND_GOOGLE_DRIVE)
+        self._backend.addItem("S3 Compatible", RCLONE_BACKEND_S3)
+        backend_index = self._backend.findData(config.rclone_backend)
+        if backend_index >= 0:
+            self._backend.setCurrentIndex(backend_index)
+        self._backend.currentIndexChanged.connect(self._on_backend_changed)
+        form.addRow(self._backend_label, self._backend)
+
+        self._rclone_remote_label = QLabel("rclone Remote Name:")
         self._rclone_remote = QLineEdit(config.rclone_remote)
-        form.addRow("rclone Remote Name:", self._rclone_remote)
+        form.addRow(self._rclone_remote_label, self._rclone_remote)
 
+        self._s3_bucket_label = QLabel()
         self._s3_bucket = QLineEdit(config.s3_bucket)
-        form.addRow("S3 Bucket:", self._s3_bucket)
+        form.addRow(self._s3_bucket_label, self._s3_bucket)
 
+        self._s3_prefix_label = QLabel()
         self._s3_prefix = QLineEdit(config.s3_prefix)
-        form.addRow("S3 Prefix / Path:", self._s3_prefix)
+        form.addRow(self._s3_prefix_label, self._s3_prefix)
 
         self._ludusavi_path = QLineEdit(config.ludusavi_path or "")
         self._ludusavi_path.setPlaceholderText("(use bundled)")
@@ -59,6 +79,8 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+        self._update_backend_fields(self._current_backend())
 
     def _make_path_row(self, line_edit: QLineEdit) -> QWidget:
         container = QWidget()
@@ -78,9 +100,37 @@ class SettingsDialog(QDialog):
         if path:
             line_edit.setText(path)
 
+    def _current_backend(self) -> str:
+        current = self._backend.currentData()
+        if isinstance(current, str):
+            return current
+        return RCLONE_BACKEND_GOOGLE_DRIVE
+
+    def _on_backend_changed(self) -> None:
+        backend = self._current_backend()
+        current_remote = self._rclone_remote.text().strip()
+        if not current_remote or current_remote in DEFAULT_RCLONE_REMOTE_BY_BACKEND.values():
+            self._rclone_remote.setText(DEFAULT_RCLONE_REMOTE_BY_BACKEND[backend])
+        self._update_backend_fields(backend)
+
+    def _update_backend_fields(self, backend: str) -> None:
+        self._rclone_remote.setPlaceholderText(DEFAULT_RCLONE_REMOTE_BY_BACKEND[backend])
+        if backend == RCLONE_BACKEND_S3:
+            self._s3_bucket_label.setText("S3 Bucket:")
+            self._s3_bucket.setPlaceholderText("my-bucket")
+            self._s3_prefix_label.setText("S3 Prefix / Path:")
+            self._s3_prefix.setPlaceholderText("savesync-bridge")
+            return
+
+        self._s3_bucket_label.setText("Drive Root Folder:")
+        self._s3_bucket.setPlaceholderText("(optional)")
+        self._s3_prefix_label.setText("Drive Folder Prefix:")
+        self._s3_prefix.setPlaceholderText("savesync-bridge")
+
     def get_config(self) -> AppConfig:
         """Return a new :class:`AppConfig` reflecting the dialog's current values."""
         return AppConfig(
+            rclone_backend=self._current_backend(),
             rclone_remote=self._rclone_remote.text().strip(),
             s3_bucket=self._s3_bucket.text().strip(),
             s3_prefix=self._s3_prefix.text().strip(),
