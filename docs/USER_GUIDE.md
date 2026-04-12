@@ -78,12 +78,12 @@ Flow:
 flowchart TD
     A[User clicks Push] --> B[Create temp staging directory]
     B --> C[Run Ludusavi backup for one game]
-    C --> D[Hash staged files and build manifest]
-    D --> E[Write manifest.json]
+    C --> D[Build content manifest from staged files]
+    D --> E[Write manifest json]
     E --> F[Upload staged game directory with rclone]
-    F --> G[Upload manifest.json with rclone]
+    F --> G[Upload manifest json with rclone]
     G --> H[Cache manifest locally]
-    H --> I[Mark game as Synced]
+    H --> I[Mark game as synced]
 ```
 
 Important behavior:
@@ -103,8 +103,8 @@ flowchart TD
     A[User clicks Pull] --> B[Create temp staging directory]
     B --> C[Download cloud files with rclone]
     C --> D[Run Ludusavi restore]
-    D --> E[Save cloud manifest as local cached manifest]
-    E --> F[Mark game as Synced]
+    D --> E[Save cloud manifest in local cache]
+    E --> F[Mark game as synced]
 ```
 
 Important behavior:
@@ -125,18 +125,18 @@ Decision flow:
 ```mermaid
 flowchart TD
     A[Load local cached manifest] --> B[Load cloud manifest]
-    B --> C{Both missing?}
+    B --> C{Both missing}
     C -->|Yes| U[Unknown]
-    C -->|No| D{Cloud missing?}
-    D -->|Yes| L[Local Newer]
-    D -->|No| E{Local missing?}
-    E -->|Yes| F[Cloud Newer]
-    E -->|No| G{Hashes equal?}
+    C -->|No| D{Cloud missing}
+    D -->|Yes| L[Local newer]
+    D -->|No| E{Local missing}
+    E -->|Yes| F[Cloud newer]
+    E -->|No| G{Hashes equal}
     G -->|Yes| H[Synced]
-    G -->|No| I{Local timestamp newer?}
-    I -->|Yes| J[Local Newer]
-    I -->|No| K{Cloud timestamp newer?}
-    K -->|Yes| M[Cloud Newer]
+    G -->|No| I{Local timestamp newer}
+    I -->|Yes| J[Local newer]
+    I -->|No| K{Cloud timestamp newer}
+    K -->|Yes| M[Cloud newer]
     K -->|No| N[Conflict]
 ```
 

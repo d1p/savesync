@@ -72,14 +72,14 @@ Flow:
 
 ```mermaid
 flowchart TD
-    A[push(game_id)] --> B[TemporaryDirectory]
-    B --> C[ludusavi.backup_game]
-    C --> D[_build_manifest]
-    D --> E[manifest_module.to_json]
-    E --> F[rclone.upload game directory]
-    F --> G[rclone.upload manifest.json]
-    G --> H[_save_local_manifest]
-    H --> I[SyncStatus.SYNCED]
+    A[Start push operation] --> B[Create temporary directory]
+    B --> C[Run Ludusavi backup]
+    C --> D[Build manifest from staged files]
+    D --> E[Serialize manifest to json]
+    E --> F[Upload game directory with rclone]
+    F --> G[Upload manifest json with rclone]
+    G --> H[Save local cached manifest]
+    H --> I[Return synced status]
 ```
 
 ### Exact Ludusavi command used for push
@@ -110,11 +110,11 @@ Flow:
 
 ```mermaid
 flowchart TD
-    A[pull(game_id, manifest)] --> B[TemporaryDirectory]
-    B --> C[rclone.download]
-    C --> D[ludusavi.restore_game]
-    D --> E[_save_local_manifest cloud manifest]
-    E --> F[SyncStatus.SYNCED]
+    A[Start pull operation] --> B[Create temporary directory]
+    B --> C[Download snapshot with rclone]
+    C --> D[Run Ludusavi restore]
+    D --> E[Save cloud manifest in local cache]
+    E --> F[Return synced status]
 ```
 
 ### Exact Ludusavi command used for pull
@@ -158,13 +158,13 @@ Flow:
 
 ```mermaid
 flowchart TD
-    A[compare(local, cloud)] --> B{local.hash == cloud.hash?}
-    B -->|Yes| C[SYNCED]
-    B -->|No| D{local.timestamp > cloud.timestamp?}
-    D -->|Yes| E[LOCAL_NEWER]
-    D -->|No| F{cloud.timestamp > local.timestamp?}
-    F -->|Yes| G[CLOUD_NEWER]
-    F -->|No| H[CONFLICT]
+    A[Compare local and cloud manifests] --> B{Hashes equal}
+    B -->|Yes| C[Synced]
+    B -->|No| D{Local timestamp newer}
+    D -->|Yes| E[Local newer]
+    D -->|No| F{Cloud timestamp newer}
+    F -->|Yes| G[Cloud newer]
+    F -->|No| H[Conflict]
 ```
 
 ### Important nuance
@@ -204,16 +204,16 @@ Flow:
 
 ```mermaid
 flowchart TD
-    A[sync(game_id)] --> B[check_status]
+    A[Start sync operation] --> B[Check status]
     B --> C{status}
     C -->|SYNCED| D[Return synced]
     C -->|CONFLICT| E[Return conflict]
-    C -->|LOCAL_NEWER| F[push]
+    C -->|LOCAL_NEWER| F[Run push]
     C -->|UNKNOWN| F
-    C -->|CLOUD_NEWER| G[get_cloud_manifest]
-    G --> H{manifest found?}
+    C -->|CLOUD_NEWER| G[Load cloud manifest]
+    G --> H{Manifest found}
     H -->|No| I[Return unknown error]
-    H -->|Yes| J[pull]
+    H -->|Yes| J[Run pull]
 ```
 
 ### Why `UNKNOWN` currently pushes
