@@ -87,6 +87,15 @@ def has_remote_config(remote: str, config_file: Path | None) -> bool:
     return parser.has_section(remote)
 
 
+def _find_free_port() -> int:
+    """Find a free TCP port on localhost."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 def configure_google_drive_remote(
     remote: str,
     config_file: Path,
@@ -96,6 +105,7 @@ def configure_google_drive_remote(
     binary: Path | None = None,
 ) -> None:
     """Create or update a Google Drive remote and save its OAuth token."""
+    port = _find_free_port()
     args = [
         "config",
         "update" if has_remote_config(remote, config_file) else "create",
@@ -115,6 +125,8 @@ def configure_google_drive_remote(
             client_id or "",
             "client_secret",
             client_secret or "",
+            "--rc-addr",
+            f"127.0.0.1:{port}",
         ]
     )
 
