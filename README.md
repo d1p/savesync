@@ -4,7 +4,7 @@ SaveSync-Bridge is a PySide6 desktop app for syncing Ludusavi-managed game saves
 
 The current app is built around a single smart sync action per game. It scans games locally with Ludusavi, compares local state against cloud metadata, then either uploads, downloads, or asks you to resolve a conflict.
 
-![SaveSync-Bridge Sync Center](docs/%7B7281175E-B10C-44CB-9395-3E567351CEEE%7D.png)
+![SaveSync-Bridge Sync Center](docs/%7B49CA6DE1-B522-4C70-8110-273287DCC97A%7D.png)
 
 ## What The App Does
 
