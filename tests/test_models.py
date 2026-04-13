@@ -85,6 +85,13 @@ def test_save_file_construction() -> None:
     assert sf.path == "slot1/save.dat"
     assert sf.size == 2048
     assert sf.modified == _NOW
+    assert sf.created is None
+
+
+def test_save_file_can_store_created_time() -> None:
+    created = datetime(2026, 4, 10, 10, 0, 0, tzinfo=_UTC)
+    sf = SaveFile(path="slot1/save.dat", size=2048, modified=_NOW, created=created)
+    assert sf.created == created
 
 
 def test_save_file_is_frozen() -> None:

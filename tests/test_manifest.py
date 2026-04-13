@@ -8,10 +8,16 @@ import pytest
 from savesync_bridge.core.manifest import (
     compare,
     compare_meta,
+    compute_confidence,
     from_json,
+    latest_modified,
+    oldest_known_created,
+    recommend_lineage,
     sync_meta_from_json,
     sync_meta_to_json,
     to_json,
+    AUTO_SYNC_CONFIDENCE_THRESHOLD,
+    ConfidenceResult,
 )
 from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncMeta, SyncStatus
 
@@ -59,7 +65,7 @@ def test_round_trip_empty_files() -> None:
 
 
 def test_round_trip_with_files() -> None:
-    sf1 = SaveFile(path="slot1/save.dat", size=1024, modified=_T1)
+    sf1 = SaveFile(path="slot1/save.dat", size=1024, modified=_T1, created=_T0)
     sf2 = SaveFile(path="slot2/save.dat", size=2048, modified=_T2)
     m = _manifest(
         game_id="Hades",
@@ -70,6 +76,12 @@ def test_round_trip_with_files() -> None:
     )
     restored = from_json(to_json(m))
     assert restored == m
+
+
+def test_round_trip_preserves_optional_created_time() -> None:
+    m = _manifest(files=(SaveFile(path="save.dat", size=128, modified=_T1, created=_T0),))
+    restored = from_json(to_json(m))
+    assert restored.files[0].created == _T0
 
 
 def test_round_trip_preserves_timezone() -> None:
@@ -111,16 +123,16 @@ def test_compare_synced_same_hash() -> None:
     assert compare(m1, m2) == SyncStatus.SYNCED
 
 
-def test_compare_local_newer() -> None:
+def test_compare_conflict_when_local_timestamp_is_newer_but_hash_differs() -> None:
     local = _manifest(timestamp=_T2, hash_="sha256:local")
     cloud = _manifest(timestamp=_T1, hash_="sha256:cloud")
-    assert compare(local, cloud) == SyncStatus.LOCAL_NEWER
+    assert compare(local, cloud) == SyncStatus.CONFLICT
 
 
-def test_compare_cloud_newer() -> None:
+def test_compare_conflict_when_cloud_timestamp_is_newer_but_hash_differs() -> None:
     local = _manifest(timestamp=_T1, hash_="sha256:local")
     cloud = _manifest(timestamp=_T2, hash_="sha256:cloud")
-    assert compare(local, cloud) == SyncStatus.CLOUD_NEWER
+    assert compare(local, cloud) == SyncStatus.CONFLICT
 
 
 def test_compare_conflict_same_timestamp_different_hash() -> None:
@@ -135,6 +147,56 @@ def test_compare_returns_sync_status_instance() -> None:
     m2 = _manifest()
     result = compare(m1, m2)
     assert isinstance(result, SyncStatus)
+
+
+def test_oldest_known_created_prefers_created_timestamp() -> None:
+    manifest = _manifest(
+        files=(
+            SaveFile(path="a", size=1, modified=_T2, created=_T1),
+            SaveFile(path="b", size=1, modified=_T1, created=_T0),
+        )
+    )
+    assert oldest_known_created(manifest) == _T0
+
+
+def test_oldest_known_created_falls_back_to_modified_timestamp() -> None:
+    manifest = _manifest(
+        files=(
+            SaveFile(path="a", size=1, modified=_T2),
+            SaveFile(path="b", size=1, modified=_T1),
+        )
+    )
+    assert oldest_known_created(manifest) == _T1
+
+
+def test_latest_modified_returns_most_recent_timestamp() -> None:
+    manifest = _manifest(
+        files=(
+            SaveFile(path="a", size=1, modified=_T0),
+            SaveFile(path="b", size=1, modified=_T2),
+        )
+    )
+    assert latest_modified(manifest) == _T2
+
+
+def test_recommend_lineage_prefers_cloud_when_local_looks_fresh() -> None:
+    local = _manifest(
+        files=(SaveFile(path="save.dat", size=1, modified=_T1, created=_T1),),
+    )
+    cloud = _manifest(
+        files=(SaveFile(path="save.dat", size=1, modified=_T2, created=_T0),),
+    )
+    assert recommend_lineage(local, cloud) == "cloud"
+
+
+def test_recommend_lineage_prefers_local_when_cloud_looks_fresh() -> None:
+    local = _manifest(
+        files=(SaveFile(path="save.dat", size=1, modified=_T2, created=_T0),),
+    )
+    cloud = _manifest(
+        files=(SaveFile(path="save.dat", size=1, modified=_T1, created=_T1),),
+    )
+    assert recommend_lineage(local, cloud) == "local"
 
 
 # ---------------------------------------------------------------------------
@@ -195,19 +257,122 @@ def test_compare_meta_synced() -> None:
     assert compare_meta(local, cloud) == SyncStatus.SYNCED
 
 
-def test_compare_meta_local_newer() -> None:
+def test_compare_meta_conflict_when_local_timestamp_is_newer_but_hash_differs() -> None:
     local = _manifest(timestamp=_T2, hash_="sha256:local")
     cloud = _sync_meta(timestamp=_T1, hash_="sha256:cloud")
-    assert compare_meta(local, cloud) == SyncStatus.LOCAL_NEWER
+    assert compare_meta(local, cloud) == SyncStatus.CONFLICT
 
 
-def test_compare_meta_cloud_newer() -> None:
+def test_compare_meta_conflict_when_cloud_timestamp_is_newer_but_hash_differs() -> None:
     local = _manifest(timestamp=_T1, hash_="sha256:local")
     cloud = _sync_meta(timestamp=_T2, hash_="sha256:cloud")
-    assert compare_meta(local, cloud) == SyncStatus.CLOUD_NEWER
+    assert compare_meta(local, cloud) == SyncStatus.CONFLICT
 
 
 def test_compare_meta_conflict() -> None:
     local = _manifest(timestamp=_T1, hash_="sha256:a")
     cloud = _sync_meta(timestamp=_T1, hash_="sha256:b")
     assert compare_meta(local, cloud) == SyncStatus.CONFLICT
+
+
+# ---------------------------------------------------------------------------
+# compute_confidence
+# ---------------------------------------------------------------------------
+
+_T_OLD = datetime(2025, 1, 1, 0, 0, 0, tzinfo=_UTC)
+_T_RECENT = datetime(2026, 4, 10, 12, 0, 0, tzinfo=_UTC)
+
+
+def test_confidence_high_when_clear_lineage_and_dir_corroboration() -> None:
+    """With clear creation gap, matching modification, and dir scan agreement → high confidence."""
+    local = _manifest(
+        hash_="sha256:local",
+        files=(SaveFile(path="save.dat", size=512, modified=_T_RECENT, created=_T_OLD),),
+    )
+    cloud = _manifest(
+        hash_="sha256:cloud",
+        files=(SaveFile(path="save.dat", size=512, modified=_T_RECENT - timedelta(hours=1), created=_T_RECENT - timedelta(days=1)),),
+    )
+    result = compute_confidence(
+        local, cloud,
+        local_dir_oldest_created=_T_OLD,
+        local_dir_file_count=3,
+    )
+    assert result.recommendation == "local"
+    assert result.score >= AUTO_SYNC_CONFIDENCE_THRESHOLD
+    assert result.safe_to_auto_sync is True
+    assert result.label == "High"
+
+
+def test_confidence_low_when_no_creation_dates() -> None:
+    """Without creation dates, confidence cannot be high."""
+    local = _manifest(
+        hash_="sha256:local",
+        files=(SaveFile(path="save.dat", size=512, modified=_T1),),
+    )
+    cloud = _manifest(
+        hash_="sha256:cloud",
+        files=(SaveFile(path="save.dat", size=512, modified=_T2),),
+    )
+    result = compute_confidence(local, cloud)
+    assert result.score < AUTO_SYNC_CONFIDENCE_THRESHOLD
+    assert result.safe_to_auto_sync is False
+
+
+def test_confidence_capped_when_no_recommendation() -> None:
+    """When recommend_lineage returns None, score is capped at 0.3."""
+    local = _manifest(
+        hash_="sha256:local",
+        files=(SaveFile(path="save.dat", size=512, modified=_T1, created=_T0),),
+    )
+    cloud = _manifest(
+        hash_="sha256:cloud",
+        files=(SaveFile(path="save.dat", size=512, modified=_T0, created=_T0),),
+    )
+    result = compute_confidence(local, cloud)
+    assert result.score <= 0.3
+
+
+def test_confidence_medium_when_close_creation_dates() -> None:
+    """Close creation dates → moderate confidence."""
+    local = _manifest(
+        hash_="sha256:local",
+        files=(SaveFile(path="save.dat", size=512, modified=_T2, created=_T0),),
+    )
+    cloud = _manifest(
+        hash_="sha256:cloud",
+        files=(SaveFile(path="save.dat", size=512, modified=_T1, created=_T0 + timedelta(hours=2)),),
+    )
+    result = compute_confidence(local, cloud)
+    assert 0.3 < result.score < AUTO_SYNC_CONFIDENCE_THRESHOLD
+
+
+def test_confidence_result_has_reasons() -> None:
+    local = _manifest(
+        hash_="sha256:local",
+        files=(SaveFile(path="save.dat", size=512, modified=_T_RECENT, created=_T_OLD),),
+    )
+    cloud = _manifest(
+        hash_="sha256:cloud",
+        files=(SaveFile(path="save.dat", size=512, modified=_T_RECENT, created=_T_RECENT),),
+    )
+    result = compute_confidence(local, cloud)
+    assert len(result.reasons) > 0
+    assert all(isinstance(r, str) for r in result.reasons)
+
+
+def test_confidence_dir_scan_contradicts_lowers_score() -> None:
+    """When directory scan contradicts the lineage recommendation, score drops."""
+    local = _manifest(
+        hash_="sha256:local",
+        files=(SaveFile(path="save.dat", size=512, modified=_T_RECENT, created=_T_OLD),),
+    )
+    cloud = _manifest(
+        hash_="sha256:cloud",
+        files=(SaveFile(path="save.dat", size=512, modified=_T_RECENT - timedelta(hours=1), created=_T_RECENT - timedelta(days=1)),),
+    )
+    # With corroborating dir scan
+    high = compute_confidence(local, cloud, local_dir_oldest_created=_T_OLD, local_dir_file_count=3)
+    # With contradicting dir scan (local dir files are NEWER than cloud creation)
+    low = compute_confidence(local, cloud, local_dir_oldest_created=_T_RECENT, local_dir_file_count=3)
+    assert high.score > low.score

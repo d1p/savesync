@@ -454,12 +454,44 @@ class MainWindow(QMainWindow):
         game_id: str,
         local_manifest: object,
         cloud_manifest: object,
+        confidence: object = None,
     ) -> None:
         if game_id not in self._games:
             return
+
+        # Import here to avoid circular imports at module level
+        from savesync_bridge.core.manifest import ConfidenceResult
+
         game = self._games[game_id]
+        updated = Game(
+            id=game.id,
+            name=game.name,
+            steam_app_id=game.steam_app_id,
+            wine_prefix=game.wine_prefix,
+            wine_user=game.wine_user,
+            save_paths=game.save_paths,
+            status=SyncStatus.CONFLICT,
+            excluded=game.excluded,
+            local_manifest=local_manifest,  # type: ignore[arg-type]
+            cloud_manifest=cloud_manifest,  # type: ignore[arg-type]
+        )
+        self._games[game_id] = updated
+        self._game_list.update_game(updated)
+
+        # If confidence is high, auto-resolve without showing dialog
+        conf: ConfidenceResult | None = confidence if isinstance(confidence, ConfidenceResult) else None
+        if conf is not None and conf.safe_to_auto_sync and conf.recommendation is not None:
+            self._debug.log_info(
+                f"Auto-resolving {game_id}: confidence {conf.score:.0%} → keep {conf.recommendation}"
+            )
+            if conf.recommendation == "local":
+                self._force_push_game(game_id)
+            else:
+                self._force_pull_game(game_id)
+            return
+
         dlg = ConflictDialog(
-            game,
+            updated,
             local_manifest,  # type: ignore[arg-type]
             cloud_manifest,  # type: ignore[arg-type]
             parent=self,

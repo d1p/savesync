@@ -10,7 +10,7 @@ The current UI is a Sync Center with these main areas:
 
 - `Refresh` rescans games visible to Ludusavi on the current machine
 - `Sync All` runs smart sync for every non-excluded game
-- each game card shows last sync time, last sync date, current status, an exclusion checkbox, and one `Sync` button
+- each game card shows last sync time, last sync date, file created/modified dates, confidence score, current status, an exclusion checkbox, and one `Sync` button
 - the left sidebar filters the list by `All Games`, `Local Newer`, `Conflicts`, `Synced`, and `Excluded`
 - the `Backup Destination` panel summarizes the active Google Drive target
 - the debug console shows exact CLI commands and output from Ludusavi and rclone
@@ -22,8 +22,36 @@ Each game ends up in one of these states:
 - `Synced`: local and cloud hashes match
 - `Local Newer`: local metadata is newer than the cloud copy
 - `Cloud Newer`: cloud metadata is newer than the local copy
-- `Conflict`: hashes differ and timestamps are equal
+- `Conflict`: hashes differ and the app cannot safely pick a side automatically
 - `Unknown`: the app does not have enough metadata yet, or a sync failed
+
+## Confidence Scoring
+
+When both local and cloud saves exist, the app computes a confidence score (0–100%) that indicates how certain it is about which side to keep.
+
+The score is built from:
+
+- how far apart the oldest file creation dates are
+- whether the most-recently-modified side matches the recommended lineage
+- how similar the file counts and total sizes are between both sides
+- whether a full scan of ALL files in the save directory confirms the recommendation
+
+The confidence label appears on each game card:
+
+- **High** (green, ≥ 85%): the app is confident and will auto-resolve conflicts without asking
+- **Medium** (yellow, 55–84%): the app has a suggestion but will always ask before replacing files
+- **Low** (red, < 55%): the app is uncertain and will always ask
+
+The conflict dialog shows the full confidence breakdown with individual reasoning bullets so you can make an informed decision.
+
+## File Dates On Game Cards
+
+Each game card now displays:
+
+- **Created**: the oldest known file creation date from your local save files
+- **Modified**: the most recent file modification date
+
+These dates come from the actual save files on disk, not from when SaveSync-Bridge last synced.
 
 ## Setup
 
@@ -162,20 +190,33 @@ Cross-platform restore works when the save paths are inside a Wine-style `drive_
 
 ## Conflict Handling
 
-A conflict happens when local and cloud hashes differ but their timestamps are equal.
+A conflict happens when local and cloud save contents differ (different hashes).
 
-When that occurs, the app opens a side-by-side comparison dialog and asks what to keep.
+When a conflict is detected:
+
+- If confidence is **High** (≥ 85%), the app auto-resolves by pushing or pulling the recommended side. No dialog is shown.
+- If confidence is **Medium** or **Low**, the app opens a side-by-side comparison dialog.
+
+The conflict dialog shows:
+
+- snapshot times, oldest file creation dates, and latest modification dates for both sides
+- per-file timestamps (created and modified) for up to 3 files on each side
+- confidence score with label and reasoning
+- a recommendation when one side clearly has the older-established save lineage
+- the recommended action is preselected as the default button
 
 ```mermaid
 flowchart TD
-    A[Conflict detected] --> B[Show local and cloud snapshot details]
-    B --> C{User choice}
-    C -->|Keep Mine| D[Force push local snapshot]
-    C -->|Keep Cloud| E[Fetch cloud manifest and force pull]
-    C -->|Cancel| F[Leave both sides unchanged]
+    A[Conflict detected] --> B{Confidence ≥ 85%?}
+    B -->|Yes| C[Auto-resolve: push or pull recommended side]
+    B -->|No| D[Show comparison dialog]
+    D --> E{User choice}
+    E -->|Keep Mine| F[Force push local snapshot]
+    E -->|Keep Cloud| G[Fetch cloud manifest and force pull]
+    E -->|Cancel| H[Leave both sides unchanged]
 ```
 
-No automatic merge is attempted.
+No automatic merge is attempted. The replacement unit is always the whole game backup.
 
 ## What “Newer” Means
 
@@ -183,9 +224,9 @@ No automatic merge is attempted.
 
 That means:
 
-- SaveSync-Bridge compares one top-level timestamp for the local snapshot
-- it compares that against one top-level timestamp for the cloud snapshot or sync metadata
-- it does not inspect individual file modification times to choose a winner
+- SaveSync-Bridge compares content hashes and timestamps at the snapshot level
+- individual file modification times are used for confidence scoring and user guidance, not for choosing a winner
+- if hashes differ, the result is always a conflict (never a silent overwrite)
 
 ## What Gets Replaced
 

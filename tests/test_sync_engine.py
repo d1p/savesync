@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,8 +10,9 @@ import pytest
 from savesync_bridge.core import manifest as manifest_module
 from savesync_bridge.core.config import AppConfig
 from savesync_bridge.core.exceptions import LudusaviError, RcloneError
-from savesync_bridge.core.sync_engine import SyncEngine, SyncResult
+from savesync_bridge.core.sync_engine import SyncEngine, SyncResult, scan_save_directories
 from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncMeta, SyncStatus
+from savesync_bridge.cli.ludusavi import LudusaviGame, SaveFileInfo
 
 GAME_ID = "Hades"
 
@@ -148,6 +150,41 @@ class TestPush:
             engine.push(GAME_ID)
         state_file = tmp_path / "states" / f"{GAME_ID}.json"
         assert state_file.exists()
+
+    def test_push_preserves_source_file_modified_time(self, engine: SyncEngine, tmp_path: Path) -> None:
+        source_dir = tmp_path / "live-save"
+        source_dir.mkdir()
+        source_file = source_dir / "Profile1.sav"
+        source_file.write_bytes(b"live-data")
+        modified_ts = datetime(2026, 4, 12, 9, 30, 0, tzinfo=UTC).timestamp()
+        os.utime(source_file, (modified_ts, modified_ts))
+
+        live_game = LudusaviGame(
+            name=GAME_ID,
+            save_files=[SaveFileInfo(path=str(source_file), size=source_file.stat().st_size, hash="")],
+            save_paths=[str(source_dir)],
+        )
+
+        def fake_backup(game_name: str, output_dir: Path, binary=None) -> Path:
+            source_drive = source_file.drive.replace(":", "") or "0"
+            source_tail = Path(str(source_file).replace(source_file.drive, "").lstrip("\\/"))
+            staged = output_dir / "backup-1" / f"drive-{source_drive}" / source_tail
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            staged.write_bytes(source_file.read_bytes())
+            return output_dir
+
+        with (
+            patch("savesync_bridge.core.sync_engine.ludusavi") as mock_lud,
+            patch("savesync_bridge.core.sync_engine.rclone"),
+        ):
+            mock_lud.get_game.return_value = live_game
+            mock_lud.backup_game.side_effect = fake_backup
+            engine.push(GAME_ID)
+
+        saved_manifest = engine.get_local_manifest(GAME_ID)
+        assert saved_manifest is not None
+        profile = next(f for f in saved_manifest.files if f.path.endswith("Profile1.sav"))
+        assert profile.modified == datetime(2026, 4, 12, 9, 30, 0, tzinfo=UTC)
 
     def test_returns_unknown_on_ludusavi_error(self, engine: SyncEngine) -> None:
         with (
@@ -320,7 +357,9 @@ class TestCheckStatus:
             result = engine.check_status(GAME_ID)
         assert result.status == SyncStatus.UNKNOWN
 
-    def test_local_newer_status_from_manifest_compare(self, engine: SyncEngine) -> None:
+    def test_conflict_status_from_manifest_compare_when_local_timestamp_is_newer(
+        self, engine: SyncEngine
+    ) -> None:
         local = _make_manifest(ts=datetime(2026, 4, 12, 12, 0, 0, tzinfo=UTC))
         cloud = _make_manifest(
             ts=datetime(2026, 4, 12, 10, 0, 0, tzinfo=UTC),
@@ -332,9 +371,11 @@ class TestCheckStatus:
             patch.object(engine, "get_cloud_manifest", return_value=cloud),
         ):
             result = engine.check_status(GAME_ID)
-        assert result.status == SyncStatus.LOCAL_NEWER
+        assert result.status == SyncStatus.CONFLICT
 
-    def test_cloud_newer_status_from_manifest_compare(self, engine: SyncEngine) -> None:
+    def test_conflict_status_from_manifest_compare_when_cloud_timestamp_is_newer(
+        self, engine: SyncEngine
+    ) -> None:
         local = _make_manifest(
             ts=datetime(2026, 4, 12, 8, 0, 0, tzinfo=UTC),
             content_hash="sha256:old",
@@ -349,7 +390,28 @@ class TestCheckStatus:
             patch.object(engine, "get_cloud_manifest", return_value=cloud),
         ):
             result = engine.check_status(GAME_ID)
-        assert result.status == SyncStatus.CLOUD_NEWER
+        assert result.status == SyncStatus.CONFLICT
+
+    def test_conflict_status_from_sync_meta_fast_path_when_hash_differs(
+        self, engine: SyncEngine
+    ) -> None:
+        local = _make_manifest(content_hash="sha256:old")
+        self._write_local(engine, local)
+        cloud_meta = SyncMeta(
+            game_id=GAME_ID,
+            hash="sha256:new",
+            timestamp=datetime(2026, 4, 12, 12, 0, 0, tzinfo=UTC),
+            compressed=True,
+            archive_name="save.tar.gz",
+            total_size=1024,
+        )
+        with (
+            patch.object(engine, "_get_cloud_sync_meta", return_value=cloud_meta),
+            patch.object(engine, "get_cloud_manifest") as mock_full,
+        ):
+            result = engine.check_status(GAME_ID)
+        assert result.status == SyncStatus.CONFLICT
+        mock_full.assert_not_called()
 
     def test_uses_sync_meta_fast_path(self, engine: SyncEngine) -> None:
         """check_status should use sync_meta when available, skipping full manifest fetch."""
@@ -464,3 +526,61 @@ class TestSync:
             result = engine.sync(GAME_ID)
         assert result.status == SyncStatus.UNKNOWN
         assert result.error is not None
+
+    def test_sync_uses_live_local_probe_instead_of_cached_manifest(self, engine: SyncEngine) -> None:
+        cached = _make_manifest(content_hash="sha256:same")
+        live_local = _make_manifest(content_hash="sha256:live")
+        cloud = _make_manifest(content_hash="sha256:same")
+        engine._save_local_manifest(cached)
+
+        with (
+            patch.object(engine, "_probe_live_local_manifest", return_value=(True, live_local)),
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
+            patch.object(engine, "get_cloud_manifest", return_value=cloud),
+        ):
+            result = engine.sync(GAME_ID)
+
+        assert result.status == SyncStatus.CONFLICT
+        assert result.local_manifest == live_local
+        assert result.cloud_manifest == cloud
+
+
+# ---------------------------------------------------------------------------
+# scan_save_directories
+# ---------------------------------------------------------------------------
+
+
+class TestScanSaveDirectories:
+    def test_returns_stats_for_existing_files(self, tmp_path: Path) -> None:
+        save_dir = tmp_path / "saves"
+        save_dir.mkdir()
+        (save_dir / "slot1.sav").write_text("data1")
+        (save_dir / "slot2.sav").write_text("more data here")
+
+        stat = scan_save_directories([str(save_dir)])
+        assert stat.total_files == 2
+        assert stat.total_size > 0
+        assert stat.oldest_modified is not None
+        assert stat.newest_modified is not None
+
+    def test_handles_nonexistent_directory(self) -> None:
+        stat = scan_save_directories(["/nonexistent/path"])
+        assert stat.total_files == 0
+        assert stat.total_size == 0
+        assert stat.oldest_created is None
+
+    def test_scans_subdirectories_recursively(self, tmp_path: Path) -> None:
+        (tmp_path / "sub" / "deep").mkdir(parents=True)
+        (tmp_path / "file1.dat").write_text("a")
+        (tmp_path / "sub" / "file2.dat").write_text("bb")
+        (tmp_path / "sub" / "deep" / "file3.dat").write_text("ccc")
+
+        stat = scan_save_directories([str(tmp_path)])
+        assert stat.total_files == 3
+
+    def test_empty_directory_returns_zero_stats(self, tmp_path: Path) -> None:
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        stat = scan_save_directories([str(empty)])
+        assert stat.total_files == 0
+        assert stat.total_size == 0

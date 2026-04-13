@@ -28,6 +28,16 @@ def _save_file(path: str, size: int = 512) -> SaveFile:
     return SaveFile(path=path, size=size, modified=_NOW)
 
 
+def _save_file_with_dates(
+    path: str,
+    *,
+    size: int = 512,
+    modified: datetime = _NOW,
+    created: datetime | None = None,
+) -> SaveFile:
+    return SaveFile(path=path, size=size, modified=modified, created=created)
+
+
 @pytest.fixture()
 def sample_game() -> Game:
     return Game(id="game1", name="Test Game", status=SyncStatus.SYNCED)
@@ -187,6 +197,42 @@ def test_game_card_never_synced_label(qtbot):
     assert card._sync_label.text() == "Never synced"
 
 
+def test_game_card_shows_fresh_local_warning_when_cloud_looks_older(qtbot):
+    local = GameManifest(
+        game_id="game1",
+        host=Platform.WINDOWS,
+        timestamp=_NOW,
+        hash="sha256:local",
+        files=(_save_file_with_dates("save.dat", modified=_NOW, created=_NOW),),
+    )
+    cloud = GameManifest(
+        game_id="game1",
+        host=Platform.LINUX,
+        timestamp=_NOW,
+        hash="sha256:cloud",
+        files=(_save_file_with_dates("save.dat", modified=_NOW, created=_EARLIER),),
+    )
+    game = Game(
+        id="game1",
+        name="Test Game",
+        status=SyncStatus.CONFLICT,
+        local_manifest=local,
+        cloud_manifest=cloud,
+    )
+    card = GameCard(game)
+    qtbot.addWidget(card)
+
+    assert not card._warning_label.isHidden()
+    assert "Fresh local save detected" in card._warning_label.text()
+
+
+def test_game_card_hides_warning_without_lineage_signal(qtbot, sample_game):
+    card = GameCard(sample_game)
+    qtbot.addWidget(card)
+
+    assert card._warning_label.isHidden()
+
+
 # ---------------------------------------------------------------------------
 # GameListWidget tests
 # ---------------------------------------------------------------------------
@@ -275,6 +321,48 @@ def test_conflict_dialog_default_choice(qtbot, sample_game, local_manifest, clou
     qtbot.addWidget(dlg)
 
     assert dlg.get_choice() == ConflictDialog.Choice.KEEP_NEITHER
+
+
+def test_conflict_dialog_suggests_cloud_when_local_looks_fresh(qtbot, sample_game):
+    local = GameManifest(
+        game_id="game1",
+        host=Platform.WINDOWS,
+        timestamp=_NOW,
+        hash="sha256:local",
+        files=(_save_file_with_dates("save.dat", modified=_NOW, created=_NOW),),
+    )
+    cloud = GameManifest(
+        game_id="game1",
+        host=Platform.LINUX,
+        timestamp=_NOW,
+        hash="sha256:cloud",
+        files=(_save_file_with_dates("save.dat", modified=_NOW, created=_EARLIER),),
+    )
+    dlg = ConflictDialog(sample_game, local, cloud)
+    qtbot.addWidget(dlg)
+
+    assert dlg.get_suggested_choice() == ConflictDialog.Choice.KEEP_CLOUD
+
+
+def test_conflict_dialog_suggests_local_when_cloud_looks_fresh(qtbot, sample_game):
+    local = GameManifest(
+        game_id="game1",
+        host=Platform.WINDOWS,
+        timestamp=_NOW,
+        hash="sha256:local",
+        files=(_save_file_with_dates("save.dat", modified=_NOW, created=_EARLIER),),
+    )
+    cloud = GameManifest(
+        game_id="game1",
+        host=Platform.LINUX,
+        timestamp=_NOW,
+        hash="sha256:cloud",
+        files=(_save_file_with_dates("save.dat", modified=_NOW, created=_NOW),),
+    )
+    dlg = ConflictDialog(sample_game, local, cloud)
+    qtbot.addWidget(dlg)
+
+    assert dlg.get_suggested_choice() == ConflictDialog.Choice.KEEP_LOCAL
 
 
 def test_conflict_dialog_keep_local(qtbot, sample_game, local_manifest, cloud_manifest):
@@ -411,3 +499,81 @@ def _find_button(parent: object, text: str) -> QPushButton | None:
         if btn.text() == text:
             return btn
     return None
+
+
+# ---------------------------------------------------------------------------
+# Game card — file dates and confidence labels
+# ---------------------------------------------------------------------------
+
+
+def test_game_card_shows_file_dates_when_manifest_has_created(qtbot, sample_game, local_manifest) -> None:
+    """The file dates label should be visible when the manifest has file timestamps."""
+    game = Game(
+        id=sample_game.id,
+        name=sample_game.name,
+        status=SyncStatus.SYNCED,
+        local_manifest=local_manifest,
+    )
+    card = GameCard(game)
+    qtbot.addWidget(card)
+    assert not card._file_dates_label.isHidden()
+    assert "Modified:" in card._file_dates_label.text()
+
+
+def test_game_card_hides_file_dates_without_manifest(qtbot, sample_game) -> None:
+    card = GameCard(sample_game)
+    qtbot.addWidget(card)
+    assert card._file_dates_label.isHidden()
+
+
+def test_game_card_shows_confidence_when_both_manifests_present(
+    qtbot, sample_game, local_manifest, cloud_manifest
+) -> None:
+    game = Game(
+        id=sample_game.id,
+        name=sample_game.name,
+        status=SyncStatus.CONFLICT,
+        local_manifest=local_manifest,
+        cloud_manifest=cloud_manifest,
+    )
+    card = GameCard(game)
+    qtbot.addWidget(card)
+    assert not card._confidence_label.isHidden()
+    assert "Confidence:" in card._confidence_label.text()
+
+
+def test_game_card_hides_confidence_without_cloud_manifest(
+    qtbot, sample_game, local_manifest
+) -> None:
+    game = Game(
+        id=sample_game.id,
+        name=sample_game.name,
+        status=SyncStatus.SYNCED,
+        local_manifest=local_manifest,
+    )
+    card = GameCard(game)
+    qtbot.addWidget(card)
+    assert card._confidence_label.isHidden()
+
+
+# ---------------------------------------------------------------------------
+# Conflict dialog — confidence display
+# ---------------------------------------------------------------------------
+
+
+def test_conflict_dialog_shows_confidence(
+    qtbot, sample_game, local_manifest, cloud_manifest
+) -> None:
+    game = Game(
+        id=sample_game.id,
+        name=sample_game.name,
+        status=SyncStatus.CONFLICT,
+        local_manifest=local_manifest,
+        cloud_manifest=cloud_manifest,
+    )
+    dlg = ConflictDialog(game, local_manifest, cloud_manifest)
+    qtbot.addWidget(dlg)
+    conf = dlg.get_confidence()
+    assert conf is not None
+    assert 0.0 <= conf.score <= 1.0
+    assert isinstance(conf.reasons, tuple)

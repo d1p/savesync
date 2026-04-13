@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from savesync_bridge.core import manifest as manifest_module
 from savesync_bridge.models.game import Game, GameManifest
 from savesync_bridge.ui.theme import DARK_PALETTE
 
@@ -26,6 +27,28 @@ def _format_size(size: int) -> str:
     if size < 1024 * 1024:
         return f"{size / 1024:.1f} KB"
     return f"{size / (1024 * 1024):.1f} MB"
+
+
+def _format_dt(value: object) -> str:
+    if value is None:
+        return "Unknown"
+    return value.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _recommendation(recommended_lineage: manifest_module.LineageRecommendation | None) -> str | None:
+    if recommended_lineage == "local":
+        return (
+            "Recommendation: your local files look like the older-established save lineage. "
+            "The cloud files were created later, which often happens after a fresh start or launcher touch."
+        )
+
+    if recommended_lineage == "cloud":
+        return (
+            "Recommendation: the cloud files look like the older-established save lineage. "
+            "Your local files were created later, which can indicate a fresh start or a recreated save set."
+        )
+
+    return None
 
 
 class ConflictDialog(QDialog):
@@ -49,6 +72,7 @@ class ConflictDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self._choice = ConflictDialog.Choice.KEEP_NEITHER
+        self._suggested_choice = ConflictDialog.Choice.KEEP_NEITHER
         self.setWindowTitle(f"Conflict — {game.name}")
         self.setMinimumWidth(640)
         self._build_ui(game, local_manifest, cloud_manifest)
@@ -69,12 +93,46 @@ class ConflictDialog(QDialog):
         layout.addWidget(title)
 
         subtitle = QLabel(
-            "Both your local save and the cloud save have changed independently. "
-            "Choose which version to keep."
+            "The save contents differ, so SaveSync stopped instead of trusting file timestamps alone. "
+            "Choose which version to keep after reviewing the original file dates below."
         )
         subtitle.setStyleSheet(f"color: {DARK_PALETTE['text_dim']}; font-size: 10pt;")
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
+
+        recommended_lineage = manifest_module.recommend_lineage(local_manifest, cloud_manifest)
+        recommendation = _recommendation(recommended_lineage)
+
+        # Compute confidence
+        self._confidence = manifest_module.compute_confidence(local_manifest, cloud_manifest)
+
+        if recommendation is not None:
+            recommendation_label = QLabel(recommendation)
+            recommendation_label.setWordWrap(True)
+            recommendation_label.setStyleSheet(
+                "background: rgba(166, 227, 161, 0.08); "
+                "border: 1px solid rgba(166, 227, 161, 0.25); "
+                "border-radius: 8px; padding: 10px;"
+                f"color: {DARK_PALETTE['text']}; font-size: 10pt;"
+            )
+            layout.addWidget(recommendation_label)
+
+        # Confidence indicator
+        conf = self._confidence
+        color_map = {"High": "#a6e3a1", "Medium": "#f9e2af", "Low": "#f38ba8"}
+        conf_color = color_map.get(conf.label, DARK_PALETTE["text_dim"])
+        conf_text = f"Confidence: {conf.label} ({conf.score:.0%})"
+        if conf.reasons:
+            conf_text += "\n" + "\n".join(f"  • {r}" for r in conf.reasons)
+        conf_label = QLabel(conf_text)
+        conf_label.setWordWrap(True)
+        conf_label.setStyleSheet(
+            f"background: rgba(205, 214, 244, 0.05); "
+            f"border: 1px solid {conf_color}40; "
+            f"border-radius: 8px; padding: 10px;"
+            f"color: {DARK_PALETTE['text']}; font-size: 9pt;"
+        )
+        layout.addWidget(conf_label)
 
         # Side-by-side panels
         panels_row = QHBoxLayout()
@@ -100,6 +158,17 @@ class ConflictDialog(QDialog):
         keep_cloud_btn.setToolTip("Download the cloud save and overwrite your local files")
         cancel_btn = QPushButton("Cancel (Do Nothing)")
         cancel_btn.setToolTip("Leave both saves unchanged and resolve later")
+
+        if recommended_lineage == "local":
+            self._suggested_choice = ConflictDialog.Choice.KEEP_LOCAL
+            keep_local_btn.setDefault(True)
+            keep_local_btn.setAutoDefault(True)
+            keep_local_btn.setFocus()
+        elif recommended_lineage == "cloud":
+            self._suggested_choice = ConflictDialog.Choice.KEEP_CLOUD
+            keep_cloud_btn.setDefault(True)
+            keep_cloud_btn.setAutoDefault(True)
+            keep_cloud_btn.setFocus()
 
         keep_local_btn.clicked.connect(self._on_keep_local)
         keep_cloud_btn.clicked.connect(self._on_keep_cloud)
@@ -133,13 +202,27 @@ class ConflictDialog(QDialog):
         layout.addWidget(title_label)
 
         ts_str = manifest.timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
-        layout.addWidget(self._dim_label(f"📅  {ts_str}"))
+        layout.addWidget(self._dim_label(f"📅  Snapshot captured {ts_str}"))
+        layout.addWidget(
+            self._dim_label(
+                f"🌱  Oldest file created {_format_dt(manifest_module.oldest_known_created(manifest))}"
+            )
+        )
+        layout.addWidget(
+            self._dim_label(
+                f"🕒  Last file modified {_format_dt(manifest_module.latest_modified(manifest))}"
+            )
+        )
         layout.addWidget(self._dim_label(f"📁  {len(manifest.files)} file(s)"))
         layout.addWidget(self._dim_label(f"💾  {_format_size(_total_size(manifest))}"))
 
-        # Show up to 3 files
+        # Show up to 3 files with timestamps
         for sf in list(manifest.files)[:3]:
-            lbl = QLabel(f"  • {sf.path}  ({_format_size(sf.size)})")
+            file_detail = f"  • {sf.path}  ({_format_size(sf.size)})"
+            if sf.created is not None:
+                file_detail += f"  created {_format_dt(sf.created)}"
+            file_detail += f"  modified {_format_dt(sf.modified)}"
+            lbl = QLabel(file_detail)
             lbl.setStyleSheet(
                 f"color: {DARK_PALETTE['text_dim']}; font-size: 9pt; background: transparent;"
             )
@@ -179,3 +262,11 @@ class ConflictDialog(QDialog):
     def get_choice(self) -> ConflictDialog.Choice:
         """Return the user's resolution choice."""
         return self._choice
+
+    def get_suggested_choice(self) -> ConflictDialog.Choice:
+        """Return the heuristic default choice shown to the user."""
+        return self._suggested_choice
+
+    def get_confidence(self) -> manifest_module.ConfidenceResult:
+        """Return the computed confidence result."""
+        return self._confidence

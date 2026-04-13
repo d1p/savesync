@@ -24,6 +24,7 @@ class SaveFile:
     path: str
     size: int
     modified: datetime
+    created: datetime | None = None
 
 
 @dataclass(frozen=True)

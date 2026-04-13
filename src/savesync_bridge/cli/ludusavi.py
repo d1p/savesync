@@ -43,7 +43,10 @@ class LudusaviGame:
     save_paths: list[str] = field(default_factory=list)
 
 
-def list_games(binary: Path | None = None) -> list[LudusaviGame]:
+def list_games(
+    games: list[str] | None = None,
+    binary: Path | None = None,
+) -> list[LudusaviGame]:
     """Run `ludusavi backup --preview --api` and parse JSON output.
 
     Uses the backup-preview mode to enumerate only games that are
@@ -51,6 +54,7 @@ def list_games(binary: Path | None = None) -> list[LudusaviGame]:
     ``manifest show`` which downloads/processes every known game.
 
     Args:
+        games: Optional subset of specific game identifiers to preview.
         binary: Path to the ludusavi binary. Defaults to ``resolve_ludusavi()``.
 
     Returns:
@@ -62,8 +66,12 @@ def list_games(binary: Path | None = None) -> list[LudusaviGame]:
     if binary is None:
         binary = resolve_ludusavi()
 
+    cmd = [str(binary), "backup", "--preview", "--api"]
+    if games:
+        cmd.extend(games)
+
     result = _run(
-        [str(binary), "backup", "--preview", "--api"],
+        cmd,
         capture_output=True,
         text=True,
         check=False,
@@ -116,6 +124,14 @@ def list_games(binary: Path | None = None) -> list[LudusaviGame]:
         )
 
     return games
+
+
+def get_game(game_name: str, binary: Path | None = None) -> LudusaviGame | None:
+    """Preview one game and return its live save scan if Ludusavi reports it."""
+    for game in list_games(games=[game_name], binary=binary):
+        if game.name == game_name:
+            return game
+    return None
 
 
 def backup_game(

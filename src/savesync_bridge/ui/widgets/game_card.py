@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from savesync_bridge.core import manifest as manifest_module
 from savesync_bridge.models.game import Game, SyncStatus
 from savesync_bridge.ui.theme import DARK_PALETTE
 from savesync_bridge.ui.widgets.status_badge import StatusBadge
@@ -41,6 +42,35 @@ def _format_sync_date(game: Game) -> str:
         return ""
     ts = game.local_manifest.timestamp
     return ts.strftime("%b %d, %Y at %I:%M %p")
+
+
+def _format_dt_short(value: datetime | None) -> str:
+    if value is None:
+        return "—"
+    return value.strftime("%b %d, %Y %I:%M %p")
+
+
+def _format_file_dates(game: Game) -> str:
+    """Return a compact string with oldest-created and latest-modified dates."""
+    m = game.local_manifest
+    if m is None:
+        return ""
+    oldest = manifest_module.oldest_known_created(m)
+    latest = manifest_module.latest_modified(m)
+    parts: list[str] = []
+    if oldest is not None:
+        parts.append(f"Created: {_format_dt_short(oldest)}")
+    if latest is not None:
+        parts.append(f"Modified: {_format_dt_short(latest)}")
+    return "  ·  ".join(parts)
+
+
+def _fresh_local_save_warning(game: Game) -> str | None:
+    if game.local_manifest is None or game.cloud_manifest is None:
+        return None
+    if manifest_module.recommend_lineage(game.local_manifest, game.cloud_manifest) != "cloud":
+        return None
+    return "Fresh local save detected. Cloud looks like the older save lineage."
 
 
 class GameCard(QFrame):
@@ -106,6 +136,34 @@ class GameCard(QFrame):
         meta_row.addStretch()
         info_col.addLayout(meta_row)
 
+        # File dates row (created / modified)
+        self._file_dates_label = QLabel()
+        self._file_dates_label.setStyleSheet(
+            f"font-size: 8pt; color: {DARK_PALETTE['text_dim']};"
+            "background: transparent; border: none;"
+        )
+        info_col.addWidget(self._file_dates_label)
+
+        # Confidence label
+        self._confidence_label = QLabel()
+        self._confidence_label.setStyleSheet(
+            "font-size: 8pt; padding: 2px 6px; border-radius: 4px;"
+            "background: transparent; border: none;"
+        )
+        self._confidence_label.setVisible(False)
+        info_col.addWidget(self._confidence_label)
+
+        self._warning_label = QLabel()
+        self._warning_label.setWordWrap(True)
+        self._warning_label.setVisible(False)
+        self._warning_label.setStyleSheet(
+            "font-size: 9pt; padding: 6px 8px; border-radius: 8px;"
+            "background: rgba(250, 179, 135, 0.10);"
+            "border: 1px solid rgba(250, 179, 135, 0.28);"
+            f"color: {DARK_PALETTE['text']};"
+        )
+        info_col.addWidget(self._warning_label)
+
         outer.addLayout(info_col)
         outer.addStretch()
 
@@ -150,6 +208,33 @@ class GameCard(QFrame):
         self._name_label.setText(game.name)
         self._sync_label.setText(_format_last_sync(game))
         self._date_label.setText(_format_sync_date(game))
+
+        # File dates
+        file_dates_text = _format_file_dates(game)
+        self._file_dates_label.setText(file_dates_text)
+        self._file_dates_label.setVisible(bool(file_dates_text))
+
+        # Confidence scoring
+        if game.local_manifest is not None and game.cloud_manifest is not None:
+            confidence = manifest_module.compute_confidence(
+                game.local_manifest, game.cloud_manifest,
+            )
+            color_map = {"High": "#a6e3a1", "Medium": "#f9e2af", "Low": "#f38ba8"}
+            color = color_map.get(confidence.label, DARK_PALETTE["text_dim"])
+            self._confidence_label.setText(
+                f"Confidence: {confidence.label} ({confidence.score:.0%})"
+            )
+            self._confidence_label.setStyleSheet(
+                f"font-size: 8pt; color: {color}; padding: 2px 6px;"
+                "border-radius: 4px; background: transparent; border: none;"
+            )
+            self._confidence_label.setVisible(True)
+        else:
+            self._confidence_label.setVisible(False)
+
+        warning = _fresh_local_save_warning(game)
+        self._warning_label.setText(warning or "")
+        self._warning_label.setVisible(warning is not None)
         self._badge.set_status(game.status)
         # Update exclude checkbox without retriggering signal
         self._exclude_cb.blockSignals(True)

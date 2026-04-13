@@ -8,6 +8,7 @@ import pytest
 
 from savesync_bridge.cli.ludusavi import (
     backup_game,
+    get_game,
     list_games,
     restore_game,
 )
@@ -116,6 +117,26 @@ class TestListGames:
         args = mock_run.call_args[0][0]
         assert args[0] == str(FAKE_BINARY)
         assert args[1:] == ["backup", "--preview", "--api"]
+
+    def test_can_preview_specific_game(self) -> None:
+        proc = _make_proc(stdout=json.dumps(BACKUP_PREVIEW_JSON))
+        with patch("subprocess.run", return_value=proc) as mock_run:
+            list_games(games=["Hades"], binary=FAKE_BINARY)
+        args = mock_run.call_args[0][0]
+        assert args[-1] == "Hades"
+
+    def test_get_game_returns_matching_game(self) -> None:
+        proc = _make_proc(stdout=json.dumps(BACKUP_PREVIEW_JSON))
+        with patch("subprocess.run", return_value=proc):
+            game = get_game("Hades", binary=FAKE_BINARY)
+        assert game is not None
+        assert game.name == "Hades"
+
+    def test_get_game_returns_none_when_missing(self) -> None:
+        proc = _make_proc(stdout=json.dumps(BACKUP_PREVIEW_JSON))
+        with patch("subprocess.run", return_value=proc):
+            game = get_game("Missing", binary=FAKE_BINARY)
+        assert game is None
 
     def test_no_shell_true(self) -> None:
         proc = _make_proc(stdout=json.dumps(BACKUP_PREVIEW_JSON))

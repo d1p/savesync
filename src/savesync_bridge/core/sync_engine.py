@@ -9,6 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from savesync_bridge.cli import ludusavi, rclone
 from savesync_bridge.core import manifest as manifest_module
@@ -23,6 +24,16 @@ class SyncResult:
     game_id: str
     status: SyncStatus
     error: str | None = None
+    local_manifest: GameManifest | None = None
+    cloud_manifest: GameManifest | None = None
+    confidence: object | None = None  # manifest.ConfidenceResult when available
+    save_dir_stat: object | None = None  # SaveDirStat when available
+
+
+@dataclass(frozen=True)
+class _SourceFileTimes:
+    modified: datetime
+    created: datetime | None
 
 
 def _default_state_dir() -> Path:
@@ -33,7 +44,131 @@ def _default_state_dir() -> Path:
     return base / "savesync-bridge" / "states"
 
 
-def _build_manifest(game_id: str, game_dir: Path) -> GameManifest:
+def _normalize_path(path: str) -> str:
+    return path.replace("\\", "/")
+
+
+def _split_drive(path: str) -> tuple[str, str]:
+    normalized = _normalize_path(path)
+    if len(normalized) >= 2 and normalized[1] == ":":
+        return normalized[:2], normalized[2:].lstrip("/")
+    return "", normalized.lstrip("/")
+
+
+def _drive_folder_name(drive: str) -> str:
+    if not drive:
+        return "drive-0"
+    return f"drive-{drive.replace(':', '')}"
+
+
+def _source_key_for_original_path(path: str) -> tuple[str, ...]:
+    drive, remainder = _split_drive(path)
+    parts = [_drive_folder_name(drive)]
+    if remainder:
+        parts.extend(part for part in remainder.split("/") if part)
+    return tuple(parts)
+
+
+def _source_key_for_staged_path(rel_path: Path) -> tuple[str, ...] | None:
+    parts = rel_path.parts
+    drive_index = next((idx for idx, part in enumerate(parts) if part.startswith("drive-")), None)
+    if drive_index is None:
+        return None
+    return tuple(parts[drive_index:])
+
+
+def _file_created_at(stat_result: os.stat_result) -> datetime | None:
+    raw_birth = getattr(stat_result, "st_birthtime", None)
+    if raw_birth is not None:
+        return datetime.fromtimestamp(raw_birth, tz=UTC)
+    if sys.platform == "win32":
+        return datetime.fromtimestamp(stat_result.st_ctime, tz=UTC)
+    return None
+
+
+def _collect_source_file_times(game: ludusavi.LudusaviGame) -> dict[tuple[str, ...], _SourceFileTimes]:
+    source_times: dict[tuple[str, ...], _SourceFileTimes] = {}
+    for source_file in game.save_files:
+        path = Path(source_file.path)
+        try:
+            stat_result = path.stat()
+        except OSError:
+            continue
+        source_times[_source_key_for_original_path(source_file.path)] = _SourceFileTimes(
+            modified=datetime.fromtimestamp(stat_result.st_mtime, tz=UTC),
+            created=_file_created_at(stat_result),
+        )
+    return source_times
+
+
+@dataclass(frozen=True)
+class SaveDirStat:
+    """Comprehensive metadata gathered from ALL files in save game directories."""
+
+    total_files: int
+    oldest_created: datetime | None
+    newest_created: datetime | None
+    oldest_modified: datetime | None
+    newest_modified: datetime | None
+    total_size: int
+
+
+def scan_save_directories(save_paths: tuple[str, ...] | list[str]) -> SaveDirStat:
+    """Walk ALL files in the given save directories and collect metadata.
+
+    This goes beyond the Ludusavi-mapped files to check every file in the save
+    directory tree, providing a broader picture for confidence scoring.
+    """
+    total_files = 0
+    total_size = 0
+    oldest_created: datetime | None = None
+    newest_created: datetime | None = None
+    oldest_modified: datetime | None = None
+    newest_modified: datetime | None = None
+
+    for dir_path_str in save_paths:
+        dir_path = Path(dir_path_str)
+        if not dir_path.is_dir():
+            continue
+        for f in dir_path.rglob("*"):
+            if not f.is_file():
+                continue
+            try:
+                stat_result = f.stat()
+            except OSError:
+                continue
+            total_files += 1
+            total_size += stat_result.st_size
+
+            mod = datetime.fromtimestamp(stat_result.st_mtime, tz=UTC)
+            cre = _file_created_at(stat_result)
+
+            if oldest_modified is None or mod < oldest_modified:
+                oldest_modified = mod
+            if newest_modified is None or mod > newest_modified:
+                newest_modified = mod
+
+            if cre is not None:
+                if oldest_created is None or cre < oldest_created:
+                    oldest_created = cre
+                if newest_created is None or cre > newest_created:
+                    newest_created = cre
+
+    return SaveDirStat(
+        total_files=total_files,
+        oldest_created=oldest_created,
+        newest_created=newest_created,
+        oldest_modified=oldest_modified,
+        newest_modified=newest_modified,
+        total_size=total_size,
+    )
+
+
+def _build_manifest(
+    game_id: str,
+    game_dir: Path,
+    source_file_times: dict[tuple[str, ...], _SourceFileTimes] | None = None,
+) -> GameManifest:
     """Compute a GameManifest by hashing all files in *game_dir*."""
     save_files: list[SaveFile] = []
     hasher = hashlib.sha256()
@@ -43,12 +178,22 @@ def _build_manifest(game_id: str, game_dir: Path) -> GameManifest:
             continue
         data = f.read_bytes()
         hasher.update(data)
-        modified = datetime.fromtimestamp(f.stat().st_mtime, tz=UTC)
+        stat_result = f.stat()
+        modified = datetime.fromtimestamp(stat_result.st_mtime, tz=UTC)
+        created = _file_created_at(stat_result)
+        rel_path = f.relative_to(game_dir)
+        if source_file_times is not None:
+            source_key = _source_key_for_staged_path(rel_path)
+            source_time = source_file_times.get(source_key) if source_key is not None else None
+            if source_time is not None:
+                modified = source_time.modified
+                created = source_time.created
         save_files.append(
             SaveFile(
-                path=str(f.relative_to(game_dir)),
-                size=f.stat().st_size,
+                path=str(rel_path),
+                size=stat_result.st_size,
                 modified=modified,
+                created=created,
             )
         )
 
@@ -131,6 +276,36 @@ class SyncEngine:
             env.update(self._env)
         return env
 
+    def _live_source_game(self, game_id: str) -> ludusavi.LudusaviGame | None:
+        return ludusavi.get_game(game_id, binary=self._ludusavi_bin)
+
+    def _probe_live_local_manifest(self, game_id: str) -> tuple[bool, GameManifest | None]:
+        try:
+            source_game = self._live_source_game(game_id)
+        except LudusaviError:
+            return False, None
+
+        if source_game is None:
+            return True, None
+
+        source_file_times = _collect_source_file_times(source_game)
+        if not source_file_times:
+            return True, None
+
+        try:
+            with tempfile.TemporaryDirectory() as staging:
+                staging_path = Path(staging)
+                game_dir = staging_path / game_id
+                game_dir.mkdir(parents=True, exist_ok=True)
+                ludusavi.backup_game(game_id, game_dir, binary=self._ludusavi_bin)
+                return True, _build_manifest(
+                    game_id,
+                    game_dir,
+                    source_file_times=source_file_times,
+                )
+        except LudusaviError:
+            return False, None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -177,6 +352,14 @@ class SyncEngine:
         The full manifest.json is also uploaded for backward compatibility.
         """
         try:
+            try:
+                source_game = self._live_source_game(game_id)
+            except LudusaviError:
+                source_game = None
+            source_file_times = (
+                _collect_source_file_times(source_game) if source_game is not None else None
+            )
+
             with tempfile.TemporaryDirectory() as staging:
                 staging_path = Path(staging)
                 game_dir = staging_path / game_id
@@ -186,7 +369,11 @@ class SyncEngine:
                 ludusavi.backup_game(game_id, game_dir, binary=self._ludusavi_bin)
 
                 # 2. Build a content manifest
-                m = _build_manifest(game_id, game_dir)
+                m = _build_manifest(
+                    game_id,
+                    game_dir,
+                    source_file_times=source_file_times,
+                )
 
                 # 3. Compress save files into archive
                 archive_name = "save.tar.gz"
@@ -251,7 +438,11 @@ class SyncEngine:
                 # 9. Persist manifest locally so check_status can diff later
                 self._save_local_manifest(m)
 
-                return SyncResult(game_id=game_id, status=SyncStatus.SYNCED)
+                return SyncResult(
+                    game_id=game_id,
+                    status=SyncStatus.SYNCED,
+                    local_manifest=m,
+                )
 
         except (LudusaviError, RcloneError, SyncError) as exc:
             return SyncResult(game_id=game_id, status=SyncStatus.UNKNOWN, error=str(exc))
@@ -343,19 +534,24 @@ class SyncEngine:
         except (LudusaviError, RcloneError, SyncError) as exc:
             return SyncResult(game_id=game_id, status=SyncStatus.UNKNOWN, error=str(exc))
 
-    def check_status(self, game_id: str) -> SyncResult:
+    def check_status(self, game_id: str, *, use_live_local: bool = False) -> SyncResult:
         """Compare the local cached manifest with the cloud sync metadata.
 
         Tries the lightweight sync_meta.json first for speed, then falls back
         to the full manifest.json for backward compatibility.
         """
-        local = self._get_local_manifest(game_id)
+        local: GameManifest | None
+        if use_live_local:
+            live_probe_ok, live_local = self._probe_live_local_manifest(game_id)
+            local = live_local if live_probe_ok else self._get_local_manifest(game_id)
+        else:
+            local = self._get_local_manifest(game_id)
 
         # Fast path: try lightweight sync_meta.json
         cloud_meta = self._get_cloud_sync_meta(game_id)
         if cloud_meta is not None and local is not None:
             status = manifest_module.compare_meta(local, cloud_meta)
-            return SyncResult(game_id=game_id, status=status)
+            return SyncResult(game_id=game_id, status=status, local_manifest=local)
 
         # Slow path: fall back to full manifest
         cloud = self.get_cloud_manifest(game_id)
@@ -364,13 +560,18 @@ class SyncEngine:
             return SyncResult(game_id=game_id, status=SyncStatus.UNKNOWN)
 
         if cloud is None:
-            return SyncResult(game_id=game_id, status=SyncStatus.LOCAL_NEWER)
+            return SyncResult(game_id=game_id, status=SyncStatus.LOCAL_NEWER, local_manifest=local)
 
         if local is None:
-            return SyncResult(game_id=game_id, status=SyncStatus.CLOUD_NEWER)
+            return SyncResult(game_id=game_id, status=SyncStatus.CLOUD_NEWER, cloud_manifest=cloud)
 
         status = manifest_module.compare(local, cloud)
-        return SyncResult(game_id=game_id, status=status)
+        return SyncResult(
+            game_id=game_id,
+            status=status,
+            local_manifest=local,
+            cloud_manifest=cloud,
+        )
 
     def sync(
         self,
@@ -389,13 +590,41 @@ class SyncEngine:
         Returns:
             :class:`SyncResult` with the final sync status.
         """
-        status_result = self.check_status(game_id)
+        status_result = self.check_status(game_id, use_live_local=True)
 
         if status_result.status == SyncStatus.SYNCED:
             return status_result
 
         if status_result.status == SyncStatus.CONFLICT:
-            return SyncResult(game_id=game_id, status=SyncStatus.CONFLICT)
+            cloud = status_result.cloud_manifest or self.get_cloud_manifest(game_id)
+            local = status_result.local_manifest
+
+            # Scan ALL files in the save directories for broader metadata
+            dir_stat: SaveDirStat | None = None
+            confidence = None
+            if local is not None and cloud is not None:
+                try:
+                    source_game = self._live_source_game(game_id)
+                    if source_game is not None:
+                        dir_stat = scan_save_directories(source_game.save_paths)
+                except Exception:
+                    pass
+
+                confidence = manifest_module.compute_confidence(
+                    local, cloud,
+                    local_dir_oldest_created=dir_stat.oldest_created if dir_stat else None,
+                    local_dir_newest_modified=dir_stat.newest_modified if dir_stat else None,
+                    local_dir_file_count=dir_stat.total_files if dir_stat else None,
+                )
+
+            return SyncResult(
+                game_id=game_id,
+                status=SyncStatus.CONFLICT,
+                local_manifest=local,
+                cloud_manifest=cloud,
+                confidence=confidence,
+                save_dir_stat=dir_stat,
+            )
 
         if status_result.status in (SyncStatus.LOCAL_NEWER, SyncStatus.UNKNOWN):
             return self.push(game_id)

@@ -36,7 +36,7 @@ class SyncWorker(QThread):
     """
 
     game_updated = Signal(str, object)  # game_id, SyncResult
-    conflict_detected = Signal(str, object, object)  # game_id, local_manifest, cloud_manifest
+    conflict_detected = Signal(str, object, object, object)  # game_id, local_manifest, cloud_manifest, confidence
     progress = Signal(int, int)  # done, total
     finished = Signal()
     error = Signal(str)
@@ -70,9 +70,9 @@ class SyncWorker(QThread):
                 )
                 done += 1
                 if result.status == SyncStatus.CONFLICT:
-                    local = self._engine.get_local_manifest(game_id)
-                    cloud = self._engine.get_cloud_manifest(game_id)
-                    self.conflict_detected.emit(game_id, local, cloud)
+                    local = result.local_manifest or self._engine.get_local_manifest(game_id)
+                    cloud = result.cloud_manifest or self._engine.get_cloud_manifest(game_id)
+                    self.conflict_detected.emit(game_id, local, cloud, result.confidence)
                 else:
                     self.game_updated.emit(game_id, result)
                 self.progress.emit(done, total)

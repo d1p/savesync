@@ -1,6 +1,6 @@
 # SaveSync-Bridge Technical Documentation
 
-This document describes the current implementation in the repository as of v0.3.1, with emphasis on the smart-sync pipeline, cloud storage format, background workers, and restore-time path conversion.
+This document describes the current implementation in the repository as of v0.4.0, with emphasis on the smart-sync pipeline, cloud storage format, background workers, confidence scoring, and restore-time path conversion.
 
 ## Architecture Overview
 
@@ -83,7 +83,8 @@ Each `SaveFile` contains:
 
 - `path`: relative path inside the staged backup
 - `size`: bytes
-- `modified`: filesystem modification time captured from the staged file
+- `modified`: original save-file modification time when known, otherwise staged-file mtime
+- `created`: original save-file creation time when the host filesystem exposes it
 
 ### `SyncMeta`
 
@@ -107,48 +108,87 @@ Comparison logic is implemented in `core/manifest.py`.
 Rules for both `compare()` and `compare_meta()`:
 
 1. Matching hashes return `SYNCED`.
-2. Newer local timestamp returns `LOCAL_NEWER`.
-3. Newer cloud timestamp returns `CLOUD_NEWER`.
-4. Equal timestamps with different hashes return `CONFLICT`.
+2. Any hash mismatch returns `CONFLICT`.
 
 ```mermaid
 flowchart TD
     A[Compare hashes] --> B{Hashes equal?}
     B -->|Yes| C[Synced]
-    B -->|No| D{Local timestamp newer?}
-    D -->|Yes| E[Local newer]
-    D -->|No| F{Cloud timestamp newer?}
-    F -->|Yes| G[Cloud newer]
-    F -->|No| H[Conflict]
+    B -->|No| H[Conflict]
 ```
 
 Important nuance:
 
 - comparison is snapshot-level, not file-level
-- `SaveFile.modified` is informational; it is not used to choose the winner
+- timestamp ordering is no longer trusted to pick a winner when content differs
+- `SaveFile.modified` and `SaveFile.created` are used for confidence scoring and user guidance, not for silent auto-resolution
+
+## Confidence Scoring
+
+When a conflict is detected, `compute_confidence()` in `core/manifest.py` produces a 0–1 score from five weighted signals:
+
+| Signal | Weight | Description |
+|--------|--------|-------------|
+| Creation date gap | 30% | Larger gap between oldest file creation dates → higher confidence |
+| Modification recency agreement | 25% | Does the most-recently-modified side match the lineage recommendation? |
+| File count similarity | 15% | Similar file counts between local and cloud → more trustworthy |
+| Size similarity | 10% | Large total-size divergence flags data loss risk |
+| Directory scan corroboration | 20% | Does walking ALL files in the save directory confirm the recommendation? |
+
+The score is capped at 0.3 when no clear lineage recommendation exists.
+
+Threshold: **0.85** (high confidence). Above this, the engine auto-resolves the conflict without showing a dialog.
+
+The `ConfidenceResult` dataclass carries:
+
+- `score`: float 0.0–1.0
+- `recommendation`: `"local"` or `"cloud"` or `None`
+- `reasons`: tuple of human-readable explanation strings
+- `safe_to_auto_sync`: boolean
+- `label`: `"High"`, `"Medium"`, or `"Low"`
+
+## Save Directory Scanning
+
+`scan_save_directories()` in `core/sync_engine.py` walks ALL files in the save game directories reported by Ludusavi — not just the files Ludusavi maps to the staged backup. This provides a broader picture of file creation and modification times across the entire save directory tree.
+
+The resulting `SaveDirStat` contains:
+
+- `total_files`
+- `oldest_created` / `newest_created`
+- `oldest_modified` / `newest_modified`
+- `total_size`
+
+This data feeds into the directory scan corroboration signal of the confidence scorer.
 
 ## `check_status()` Behavior
 
-`SyncEngine.check_status(game_id)` now prefers the lightweight metadata path.
+`SyncEngine.check_status(game_id)` prefers the lightweight metadata path, and `SyncEngine.sync()` now refreshes live local state before making a sync decision.
 
 Flow:
 
 ```mermaid
 flowchart TD
-    A[Load local manifest] --> B[Fetch cloud sync_meta.json]
-    B --> C{Local and cloud SyncMeta available?}
-    C -->|Yes| D[compare_meta local vs cloud]
-    C -->|No| E[Fetch full cloud manifest]
-    E --> F{Both manifests missing?}
-    F -->|Yes| G[Unknown]
-    F -->|No| H{Cloud missing?}
-    H -->|Yes| I[Local newer]
-    H -->|No| J{Local missing?}
-    J -->|Yes| K[Cloud newer]
-    J -->|No| L[compare local vs cloud]
+    A[Sync only: probe live local save via Ludusavi preview plus temp backup] --> B[Fallback to cached local manifest only if live probe fails]
+    B --> C[Fetch cloud sync_meta.json]
+    C --> D{Local and cloud SyncMeta available?}
+    D -->|Yes| E[compare_meta local vs cloud]
+    D -->|No| F[Fetch full cloud manifest]
+    F --> G{Both manifests missing?}
+    G -->|Yes| H[Unknown]
+    G -->|No| I{Cloud missing?}
+    I -->|Yes| J[Local newer]
+    I -->|No| K{Local missing?}
+    K -->|Yes| L[Cloud newer]
+    K -->|No| M[compare local vs cloud]
 ```
 
 The fast path is only used when both a local manifest and cloud `sync_meta.json` exist. Otherwise the engine falls back to the full-manifest path for compatibility with older snapshots.
+
+Live local probing is intentionally conservative:
+
+- a temporary Ludusavi backup is created to compute a fresh content hash using the same staged layout as cloud snapshots
+- Ludusavi preview output supplies the original on-disk save paths
+- original file `created` and `modified` timestamps are captured from those real save files and injected into the manifest for conflict guidance
 
 ## Push Pipeline
 
@@ -157,26 +197,32 @@ Implemented in `SyncEngine.push()`.
 Sequence:
 
 1. Create a temporary staging directory.
-2. Create a per-game backup folder.
-3. Run Ludusavi backup for exactly one game.
-4. Walk staged files and build a `GameManifest`.
-5. Compress the staged backup into `save.tar.gz`.
-6. Write `manifest.json`.
-7. Write `sync_meta.json`.
-8. Upload archive and metadata files with rclone.
-9. Save the full manifest locally.
+2. Query Ludusavi preview for the game's real save paths.
+3. Capture original file timestamps from those real save files.
+4. Create a per-game backup folder.
+5. Run Ludusavi backup for exactly one game.
+6. Walk staged files and build a `GameManifest`.
+7. Overlay original file timestamps onto matching staged save entries.
+8. Compress the staged backup into `save.tar.gz`.
+9. Write `manifest.json`.
+10. Write `sync_meta.json`.
+11. Upload archive and metadata files with rclone.
+12. Save the full manifest locally.
 
 ```mermaid
 flowchart TD
-    A[Create temp staging directory] --> B[Run ludusavi backup]
-    B --> C[Build GameManifest]
-    C --> D[Create save.tar.gz]
-    D --> E[Write manifest.json]
-    E --> F[Write sync_meta.json]
-    F --> G[Upload save.tar.gz]
-    G --> H[Upload manifest.json]
-    H --> I[Upload sync_meta.json]
-    I --> J[Persist local manifest]
+    A[Preview live save paths] --> B[Capture source created and modified timestamps]
+    B --> C[Create temp staging directory]
+    C --> D[Run ludusavi backup]
+    D --> E[Build GameManifest]
+    E --> F[Overlay source timestamps]
+    F --> G[Create save.tar.gz]
+    G --> H[Write manifest.json]
+    H --> I[Write sync_meta.json]
+    I --> J[Upload save.tar.gz]
+    J --> K[Upload manifest.json]
+    K --> L[Upload sync_meta.json]
+    L --> M[Persist local manifest]
 ```
 
 Exact Ludusavi command:
@@ -245,6 +291,25 @@ This covers Steam compatdata prefixes and non-Steam titles as long as Ludusavi r
 
 The engine reports `SyncStatus.CONFLICT`; the UI owns the resolution step.
 
+When a conflict is detected, the sync engine:
+
+1. Scans ALL files in the save directory tree via `scan_save_directories()`.
+2. Computes a `ConfidenceResult` using manifest metadata plus directory scan data.
+3. Returns the confidence alongside the conflict status.
+
+The `MainWindow` then decides:
+
+- **High confidence** (score ≥ 0.85): auto-resolves by pushing or pulling based on the recommendation, without showing a dialog.
+- **Medium or Low confidence**: opens the `ConflictDialog` for manual review.
+
+The dialog shows:
+
+- snapshot capture time, oldest known file creation time, latest file modification time
+- per-file created/modified timestamps for up to 3 files on each side
+- confidence score with label and all reasoning bullets
+- a recommendation when one side clearly looks like the older-established save lineage
+- preselected default button matching the recommendation
+
 Current mapping in `MainWindow`:
 
 - `KEEP_LOCAL` triggers `_force_push_game()`
@@ -253,12 +318,14 @@ Current mapping in `MainWindow`:
 
 ```mermaid
 flowchart TD
-    A[SyncWorker emits conflict] --> B[MainWindow opens ConflictDialog]
-    B --> C{Choice}
-    C -->|Keep Mine| D[Start PushWorker]
-    C -->|Keep Cloud| E[Start FetchCloudManifestWorker]
-    E --> F[Start PullWorker]
-    C -->|Cancel| G[Return without changes]
+    A[SyncWorker emits conflict] --> B{Confidence ≥ 85%?}
+    B -->|Yes| C[Auto-resolve: push or pull]
+    B -->|No| D[Open ConflictDialog]
+    D --> E{Choice}
+    E -->|Keep Mine| F[Start PushWorker]
+    E -->|Keep Cloud| G[Start FetchCloudManifestWorker]
+    G --> H[Start PullWorker]
+    E -->|Cancel| I[Return without changes]
 ```
 
 Conflict resolution remains snapshot-level. No merge step exists.
@@ -361,7 +428,7 @@ CLI wrappers emit best-effort events to `cli_bus`:
 
 ### 1. No true three-way merge
 
-There is no stored base snapshot hash, so conflict handling is still two-sided and timestamp-based.
+There is no stored base snapshot hash, so conflict handling is still two-sided. Confidence scoring uses multiple heuristic signals rather than a deterministic common-ancestor comparison.
 
 ### 2. Snapshot-level replacement only
 
