@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QVBoxLayout,
 )
@@ -78,11 +79,16 @@ class GameCard(QFrame):
 
     sync_requested = Signal(str)
     exclude_toggled = Signal(str, bool)  # game_id, excluded
+    force_push_requested = Signal(str)
+    force_pull_requested = Signal(str)
+    verify_requested = Signal(str)
 
     def __init__(self, game: Game, parent: object = None) -> None:
         super().__init__(parent)
         self.setObjectName("game_card")
         self._game = game
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
         self._build_ui()
         self.update_game(game)
 
@@ -144,6 +150,15 @@ class GameCard(QFrame):
         )
         info_col.addWidget(self._file_dates_label)
 
+        # Machine identity + storage size row
+        self._machine_label = QLabel()
+        self._machine_label.setStyleSheet(
+            f"font-size: 8pt; color: {DARK_PALETTE['text_dim']};"
+            "background: transparent; border: none;"
+        )
+        self._machine_label.setVisible(False)
+        info_col.addWidget(self._machine_label)
+
         # Confidence label
         self._confidence_label = QLabel()
         self._confidence_label.setStyleSheet(
@@ -195,6 +210,30 @@ class GameCard(QFrame):
 
         outer.addLayout(right)
 
+    def _show_context_menu(self, pos) -> None:
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu {{ background: {DARK_PALETTE['surface0']}; color: {DARK_PALETTE['text']}; "
+            "border: 1px solid #45475a; border-radius: 6px; padding: 4px; }}"
+            f"QMenu::item:selected {{ background: {DARK_PALETTE['accent']}30; }}"
+        )
+        sync_action = menu.addAction("↻  Smart Sync")
+        sync_action.triggered.connect(lambda: self.sync_requested.emit(self._game.id))
+        menu.addSeparator()
+        push_action = menu.addAction("⬆  Force Push (Local → Cloud)")
+        push_action.triggered.connect(lambda: self.force_push_requested.emit(self._game.id))
+        pull_action = menu.addAction("⬇  Force Pull (Cloud → Local)")
+        pull_action.triggered.connect(lambda: self.force_pull_requested.emit(self._game.id))
+        menu.addSeparator()
+        verify_action = menu.addAction("🔍  Verify Cloud Integrity")
+        verify_action.triggered.connect(lambda: self.verify_requested.emit(self._game.id))
+        menu.addSeparator()
+        exclude_action = menu.addAction("Exclude" if not self._game.excluded else "Include")
+        exclude_action.triggered.connect(
+            lambda: self.exclude_toggled.emit(self._game.id, not self._game.excluded)
+        )
+        menu.exec(self.mapToGlobal(pos))
+
     def _on_exclude_toggled(self, checked: bool) -> None:
         self.exclude_toggled.emit(self._game.id, checked)
         self._sync_btn.setEnabled(not checked)
@@ -213,6 +252,25 @@ class GameCard(QFrame):
         file_dates_text = _format_file_dates(game)
         self._file_dates_label.setText(file_dates_text)
         self._file_dates_label.setVisible(bool(file_dates_text))
+
+        # Machine identity + storage size
+        machine_parts: list[str] = []
+        if game.local_manifest is not None and game.local_manifest.machine_id:
+            machine_parts.append(f"🖥 Last synced from: {game.local_manifest.machine_id}")
+        total_size = sum(f.size for f in game.local_manifest.files) if game.local_manifest else 0
+        if total_size > 0:
+            if total_size < 1024:
+                sz = f"{total_size} B"
+            elif total_size < 1024 * 1024:
+                sz = f"{total_size / 1024:.1f} KB"
+            else:
+                sz = f"{total_size / (1024 * 1024):.1f} MB"
+            machine_parts.append(f"💾 {sz}")
+        if machine_parts:
+            self._machine_label.setText("  ·  ".join(machine_parts))
+            self._machine_label.setVisible(True)
+        else:
+            self._machine_label.setVisible(False)
 
         # Confidence scoring
         if game.local_manifest is not None and game.cloud_manifest is not None:

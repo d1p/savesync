@@ -677,3 +677,39 @@ def file_exists(
         return len(entries) > 0
     except RcloneError:
         return False
+
+
+def delete_path(
+    remote: str,
+    root: str,
+    path: str,
+    env: dict[str, str] | None = None,
+    binary: Path | None = None,
+    config_file: Path | None = None,
+) -> None:
+    """Delete a directory (and all contents) from cloud storage via ``rclone purge``.
+
+    Args:
+        remote: Name of the rclone remote.
+        root: Top-level Drive folder.
+        path: Sub-path to delete.
+        env: Extra environment variables.
+        binary: Path to the rclone binary.
+        config_file: Optional rclone config file path.
+
+    Raises:
+        RcloneError: If rclone exits with a non-zero code.
+    """
+    target = _remote_target(remote, root, path)
+    result = _invoke(
+        ["purge", target],
+        env=env,
+        binary=binary,
+        config_file=config_file,
+    )
+    if result.returncode != 0:
+        raise RcloneError(
+            f"rclone purge failed: {result.stderr}",
+            result.returncode,
+            result.stderr,
+        )

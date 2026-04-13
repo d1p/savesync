@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Literal
 
 from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncMeta, SyncStatus
@@ -24,12 +25,14 @@ def to_json(manifest: GameManifest) -> str:
         "host": manifest.host.value,
         "timestamp": manifest.timestamp.isoformat(),
         "hash": manifest.hash,
+        "machine_id": manifest.machine_id,
         "files": [
             {
                 "path": f.path,
                 "size": f.size,
                 "modified": f.modified.isoformat(),
                 "created": f.created.isoformat() if f.created is not None else None,
+                "file_hash": f.file_hash,
             }
             for f in manifest.files
         ],
@@ -62,6 +65,7 @@ def from_json(data: str) -> GameManifest:
                 if f.get("created") is not None
                 else None
             ),
+            file_hash=f.get("file_hash"),
         )
         for f in obj["files"]
     )
@@ -71,6 +75,7 @@ def from_json(data: str) -> GameManifest:
         timestamp=datetime.fromisoformat(obj["timestamp"]),
         hash=obj["hash"],
         files=files,
+        machine_id=obj.get("machine_id", ""),
     )
 
 
@@ -112,6 +117,7 @@ def sync_meta_to_json(meta: SyncMeta) -> str:
         "compressed": meta.compressed,
         "archive_name": meta.archive_name,
         "total_size": meta.total_size,
+        "machine_id": meta.machine_id,
     }
     return json.dumps(data, indent=2)
 
@@ -126,6 +132,7 @@ def sync_meta_from_json(data: str) -> SyncMeta:
         compressed=obj.get("compressed", False),
         archive_name=obj.get("archive_name", ""),
         total_size=obj.get("total_size", 0),
+        machine_id=obj.get("machine_id", ""),
     )
 
 
@@ -181,6 +188,85 @@ def recommend_lineage(
         return "cloud"
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Per-file diff
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FileDiffEntry:
+    """One file's diff status between local and cloud manifests."""
+
+    path: str
+    status: str  # "unchanged", "modified", "added_local", "added_cloud", "removed_local", "removed_cloud"
+    local_file: SaveFile | None = None
+    cloud_file: SaveFile | None = None
+
+
+@dataclass(frozen=True)
+class ManifestDiff:
+    """Result of comparing two manifests at the per-file level."""
+
+    entries: tuple[FileDiffEntry, ...]
+    unchanged_count: int
+    modified_count: int
+    added_local_count: int  # files only on local side
+    added_cloud_count: int  # files only on cloud side
+    total_files: int  # union of both sides
+
+
+def diff_manifests(
+    local_manifest: GameManifest,
+    cloud_manifest: GameManifest,
+) -> ManifestDiff:
+    """Compare two manifests file-by-file using per-file content hashes.
+
+    When per-file hashes are available, uses them to determine if file content
+    is identical even when metadata (size/timestamps) may differ.  Falls back
+    to size comparison when hashes are absent.
+    """
+    local_by_path = {f.path: f for f in local_manifest.files}
+    cloud_by_path = {f.path: f for f in cloud_manifest.files}
+    all_paths = sorted(set(local_by_path) | set(cloud_by_path))
+
+    entries: list[FileDiffEntry] = []
+    unchanged = modified = added_local = added_cloud = 0
+
+    for path in all_paths:
+        local_f = local_by_path.get(path)
+        cloud_f = cloud_by_path.get(path)
+
+        if local_f is not None and cloud_f is not None:
+            # Both sides have this file — check content
+            if local_f.file_hash and cloud_f.file_hash:
+                same = local_f.file_hash == cloud_f.file_hash
+            else:
+                # Fallback: compare size as rough proxy
+                same = local_f.size == cloud_f.size
+            if same:
+                entries.append(FileDiffEntry(path, "unchanged", local_f, cloud_f))
+                unchanged += 1
+            else:
+                entries.append(FileDiffEntry(path, "modified", local_f, cloud_f))
+                modified += 1
+        elif local_f is not None:
+            entries.append(FileDiffEntry(path, "added_local", local_f, None))
+            added_local += 1
+        else:
+            entries.append(FileDiffEntry(path, "added_cloud", None, cloud_f))
+            added_cloud += 1
+
+    total = len(all_paths)
+    return ManifestDiff(
+        entries=tuple(entries),
+        unchanged_count=unchanged,
+        modified_count=modified,
+        added_local_count=added_local,
+        added_cloud_count=added_cloud,
+        total_files=total,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -240,59 +326,81 @@ def compute_confidence(
     local_modified = latest_modified(local_manifest)
     cloud_modified = latest_modified(cloud_manifest)
 
-    # --- Signal 1: Creation date gap (weight 0.30) ---
+    # --- Signal 1: Creation date gap (weight 0.25) ---
     if local_created is not None and cloud_created is not None:
         gap = abs((local_created - cloud_created).total_seconds())
         if gap > 86400 * 7:  # >7 days apart → very clear
-            weights.append((0.30, 1.0))
+            weights.append((0.25, 1.0))
             reasons.append(f"Creation dates differ by {gap / 86400:.0f} days")
         elif gap > 86400:  # >1 day
-            weights.append((0.30, 0.8))
+            weights.append((0.25, 0.8))
             reasons.append(f"Creation dates differ by {gap / 3600:.0f} hours")
         elif gap > 3600:  # >1 hour
-            weights.append((0.30, 0.5))
+            weights.append((0.25, 0.5))
             reasons.append(f"Creation dates differ by {gap / 60:.0f} minutes")
         else:
-            weights.append((0.30, 0.1))
+            weights.append((0.25, 0.1))
             reasons.append("Creation dates are very close — ambiguous")
     else:
-        weights.append((0.30, 0.0))
+        weights.append((0.25, 0.0))
         reasons.append("Missing creation date info — cannot compare origins")
 
-    # --- Signal 2: Modification recency agreement (weight 0.25) ---
+    # --- Signal 2: Modification recency agreement (weight 0.20) ---
     if local_modified is not None and cloud_modified is not None and recommendation is not None:
         newer_is_recommended = (
             (recommendation == "local" and local_modified >= cloud_modified)
             or (recommendation == "cloud" and cloud_modified >= local_modified)
         )
         if newer_is_recommended:
-            weights.append((0.25, 1.0))
+            weights.append((0.20, 1.0))
             reasons.append("Most-recently-modified side matches recommended lineage")
         else:
-            weights.append((0.25, 0.3))
+            weights.append((0.20, 0.3))
             reasons.append("Most-recently-modified side contradicts lineage recommendation")
     else:
-        weights.append((0.25, 0.0))
+        weights.append((0.20, 0.0))
 
-    # --- Signal 3: File count similarity (weight 0.15) ---
+    # --- Signal 3: Per-file content match ratio (weight 0.15) ---
+    diff = diff_manifests(local_manifest, cloud_manifest)
+    if diff.total_files > 0:
+        unchanged_ratio = diff.unchanged_count / diff.total_files
+        if unchanged_ratio >= 0.8:
+            weights.append((0.15, 0.9))
+            reasons.append(
+                f"{diff.unchanged_count}/{diff.total_files} files have identical content"
+            )
+        elif unchanged_ratio >= 0.5:
+            weights.append((0.15, 0.6))
+            reasons.append(
+                f"{diff.unchanged_count}/{diff.total_files} files have identical content"
+            )
+        else:
+            weights.append((0.15, 0.3))
+            reasons.append(
+                f"Only {diff.unchanged_count}/{diff.total_files} files match — significant divergence"
+            )
+    else:
+        weights.append((0.15, 0.0))
+
+    # --- Signal 4: File count similarity (weight 0.10) ---
     local_count = len(local_manifest.files)
     cloud_count = len(cloud_manifest.files)
     if local_count > 0 and cloud_count > 0:
         ratio = min(local_count, cloud_count) / max(local_count, cloud_count)
         if ratio >= 0.8:
-            weights.append((0.15, 0.9))
+            weights.append((0.10, 0.9))
             reasons.append(f"File counts similar ({local_count} local vs {cloud_count} cloud)")
         elif ratio >= 0.5:
-            weights.append((0.15, 0.5))
+            weights.append((0.10, 0.5))
             reasons.append(f"File counts differ ({local_count} local vs {cloud_count} cloud)")
         else:
-            weights.append((0.15, 0.2))
+            weights.append((0.10, 0.2))
             reasons.append(f"File counts very different ({local_count} local vs {cloud_count} cloud)")
     else:
-        weights.append((0.15, 0.0))
+        weights.append((0.10, 0.0))
         reasons.append("One or both sides have no files")
 
-    # --- Signal 4: Size similarity (weight 0.10) ---
+    # --- Signal 5: Size similarity (weight 0.10) ---
     local_size = sum(f.size for f in local_manifest.files)
     cloud_size = sum(f.size for f in cloud_manifest.files)
     if local_size > 0 and cloud_size > 0:
@@ -307,7 +415,7 @@ def compute_confidence(
     else:
         weights.append((0.10, 0.0))
 
-    # --- Signal 5: Directory-level creation date corroboration (weight 0.20) ---
+    # --- Signal 6: Directory-level creation date corroboration (weight 0.20) ---
     if local_dir_oldest_created is not None and cloud_created is not None and recommendation is not None:
         if recommendation == "local":
             if local_dir_oldest_created < cloud_created:
@@ -352,3 +460,78 @@ def compute_confidence(
         reasons=tuple(reasons),
         safe_to_auto_sync=safe,
     )
+
+
+# ---------------------------------------------------------------------------
+# Sync history
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SyncHistoryEntry:
+    """A single entry in the sync activity log."""
+
+    timestamp: str  # ISO format
+    game_id: str
+    action: str  # "push", "pull", "auto_push", "auto_pull", "conflict_resolved"
+    machine_id: str = ""
+    confidence: float | None = None
+    error: str | None = None
+
+
+def _history_file(state_dir: Path) -> Path:
+    return state_dir / "sync_history.json"
+
+
+def load_sync_history(state_dir: Path, limit: int = 200) -> list[SyncHistoryEntry]:
+    """Load the most recent *limit* sync history entries."""
+    path = _history_file(state_dir)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entries = [
+            SyncHistoryEntry(
+                timestamp=e["timestamp"],
+                game_id=e["game_id"],
+                action=e["action"],
+                machine_id=e.get("machine_id", ""),
+                confidence=e.get("confidence"),
+                error=e.get("error"),
+            )
+            for e in data[-limit:]
+        ]
+        return entries
+    except (json.JSONDecodeError, KeyError):
+        return []
+
+
+def append_sync_history(
+    state_dir: Path,
+    entry: SyncHistoryEntry,
+    max_entries: int = 500,
+) -> None:
+    """Append a history entry, keeping at most *max_entries*."""
+    path = _history_file(state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    entries: list[dict] = []
+    if path.exists():
+        try:
+            entries = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, ValueError):
+            entries = []
+
+    entries.append({
+        "timestamp": entry.timestamp,
+        "game_id": entry.game_id,
+        "action": entry.action,
+        "machine_id": entry.machine_id,
+        "confidence": entry.confidence,
+        "error": entry.error,
+    })
+
+    # Trim old entries
+    if len(entries) > max_entries:
+        entries = entries[-max_entries:]
+
+    path.write_text(json.dumps(entries, indent=2), encoding="utf-8")

@@ -10,8 +10,10 @@ The current UI is a Sync Center with these main areas:
 
 - `Refresh` rescans games visible to Ludusavi on the current machine
 - `Sync All` runs smart sync for every non-excluded game
-- each game card shows last sync time, last sync date, file created/modified dates, confidence score, current status, an exclusion checkbox, and one `Sync` button
+- each game card shows last sync time, last sync date, file created/modified dates, confidence score, machine identity, storage size, current status, an exclusion checkbox, and one `Sync` button
+- right-click any game card for a context menu with Smart Sync, Force Push, Force Pull, Verify Integrity, and Exclude/Include
 - the left sidebar filters the list by `All Games`, `Local Newer`, `Conflicts`, `Synced`, and `Excluded`
+- a sort dropdown lets you order games by name (A-Z or Z-A), last synced time, or status
 - the `Backup Destination` panel summarizes the active Google Drive target
 - the debug console shows exact CLI commands and output from Ludusavi and rclone
 
@@ -33,6 +35,7 @@ The score is built from:
 
 - how far apart the oldest file creation dates are
 - whether the most-recently-modified side matches the recommended lineage
+- per-file content comparison using SHA-256 hashes (detects metadata-only changes that don't affect actual save data)
 - how similar the file counts and total sizes are between both sides
 - whether a full scan of ALL files in the save directory confirms the recommendation
 
@@ -135,16 +138,16 @@ flowchart TD
     H -->|Local newer| J[Push local snapshot]
     H -->|Cloud newer| K[Pull cloud snapshot]
     H -->|Conflict| L[Open conflict dialog]
-    H -->|Unknown| M[Default to push]
+    H -->|Unknown| M[Prompt user to push or cancel]
     L --> N{Choice}
     N -->|Keep Mine| J
     N -->|Keep Cloud| K
     N -->|Cancel| O[Stop without changes]
 ```
 
-### Why `Unknown` pushes
+### Why `Unknown` shows a prompt
 
-If neither side has enough metadata to compare, SaveSync-Bridge currently treats the current machine as the source of truth and creates the first cloud snapshot by uploading it.
+If neither side has enough metadata to compare, SaveSync-Bridge shows a dialog asking whether to push the local save to the cloud or cancel. This prevents accidental overwrites on first sync.
 
 ## What A Push Actually Does
 
@@ -164,9 +167,12 @@ flowchart TD
 
 Important details:
 
+- the app acquires a cloud lock to prevent concurrent syncs from other machines
+- previous cloud snapshots are rotated into versioned backups before overwriting
 - the app uploads Ludusavi's staged backup, not raw live files directly from their original folders
 - cloud storage now prefers a compressed archive plus metadata
 - `manifest.json` is still uploaded for backward compatibility and restore logic
+- rclone operations are retried with exponential backoff on transient network errors
 
 ## What A Pull Actually Does
 
@@ -200,7 +206,9 @@ When a conflict is detected:
 The conflict dialog shows:
 
 - snapshot times, oldest file creation dates, and latest modification dates for both sides
+- the machine identity that created each snapshot
 - per-file timestamps (created and modified) for up to 3 files on each side
+- a per-file diff panel showing which files are unchanged, modified, added locally, or added in cloud (color-coded)
 - confidence score with label and reasoning
 - a recommendation when one side clearly has the older-established save lineage
 - the recommended action is preselected as the default button
@@ -271,6 +279,8 @@ Current cloud format normally includes:
 - `save.tar.gz`
 - `sync_meta.json`
 - `manifest.json`
+- `.lock` (transient, present only during active sync operations)
+- `versions/v1/`, `versions/v2/`, etc. (previous snapshots, up to `max_versions`)
 
 Older snapshots may still contain an uncompressed Ludusavi backup layout instead of `save.tar.gz`.
 
@@ -288,7 +298,23 @@ These files are sync metadata, not the actual game saves.
 - sync decisions are based on cached metadata, not a live three-way merge
 - sync is game-level, not file-level
 - native Linux save layouts outside Wine or Proton prefixes are not remapped into Windows paths
-- `Unknown` currently defaults to upload on first sync
+- `Unknown` now prompts the user instead of auto-pushing
+
+## New In v0.5.0
+
+- **Per-file SHA-256 hashes**: reduces false positive conflicts from metadata-only changes
+- **Machine identity**: see which machine last synced each game
+- **Per-file diff in conflict dialog**: color-coded comparison of individual files
+- **Backup versioning**: previous cloud snapshots are kept (configurable, default 3)
+- **Cloud lock file**: prevents concurrent sync corruption from multiple machines
+- **Sync history log**: records all push/pull operations with timestamps and outcomes
+- **Integrity verification**: check cloud archive consistency from the context menu
+- **Export/Import**: bulk download or restore cloud saves as a ZIP file
+- **Context menu**: right-click game cards for Force Push, Force Pull, Verify, Exclude
+- **Sorting**: order games by name, last synced, or status
+- **UNKNOWN prompt**: no longer auto-pushes, asks before creating first cloud snapshot
+- **Retry logic**: transient rclone errors are retried with exponential backoff
+- **Stale cache pruning**: games with missing save paths are detected and cleaned up
 
 ## Build And Run
 

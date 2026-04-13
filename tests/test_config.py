@@ -23,6 +23,8 @@ def test_app_config_defaults() -> None:
     assert cfg.rclone_path is None
     assert cfg.known_games == []
     assert cfg.excluded_games == []
+    assert cfg.machine_name == ""
+    assert cfg.max_versions == 3
 
 
 def test_app_config_fields_mutable() -> None:
@@ -131,3 +133,17 @@ def test_rclone_config_path_defaults_under_config_dir(tmp_path: Path) -> None:
 def test_load_config_returns_app_config_type(tmp_path: Path) -> None:
     result = load_config(config_dir=tmp_path)
     assert type(result) is AppConfig
+
+
+def test_save_and_load_machine_name_round_trip(tmp_path: Path) -> None:
+    cfg = AppConfig(machine_name="my-desktop")
+    save_config(cfg, config_dir=tmp_path)
+    loaded = load_config(config_dir=tmp_path)
+    assert loaded.machine_name == "my-desktop"
+
+
+def test_save_and_load_max_versions_round_trip(tmp_path: Path) -> None:
+    cfg = AppConfig(max_versions=5)
+    save_config(cfg, config_dir=tmp_path)
+    loaded = load_config(config_dir=tmp_path)
+    assert loaded.max_versions == 5

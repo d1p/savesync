@@ -25,6 +25,7 @@ class SaveFile:
     size: int
     modified: datetime
     created: datetime | None = None
+    file_hash: str | None = None  # per-file SHA-256 content hash
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class GameManifest:
     timestamp: datetime
     hash: str
     files: tuple[SaveFile, ...]
+    machine_id: str = ""  # identifies the originating machine
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,7 @@ class SyncMeta:
     compressed: bool = False
     archive_name: str = ""
     total_size: int = 0
+    machine_id: str = ""  # identifies the originating machine
 
 
 @dataclass(frozen=True)

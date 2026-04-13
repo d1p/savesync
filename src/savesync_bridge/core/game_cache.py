@@ -70,3 +70,23 @@ def _load_local_manifest(game_id: str, state_dir: Path | None) -> GameManifest |
         return manifest_module.from_json(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def prune_stale_games(games: list[Game]) -> tuple[list[Game], list[str]]:
+    """Remove games whose save paths no longer exist on disk.
+
+    Returns:
+        A tuple of (active_games, pruned_game_ids).
+    """
+    active: list[Game] = []
+    pruned: list[str] = []
+    for g in games:
+        if not g.save_paths:
+            # Games with no save paths are kept (cloud-only entries)
+            active.append(g)
+            continue
+        if any(Path(p).exists() for p in g.save_paths):
+            active.append(g)
+        else:
+            pruned.append(g.id)
+    return active, pruned

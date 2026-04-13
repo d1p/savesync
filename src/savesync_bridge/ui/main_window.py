@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QSizePolicy,
@@ -268,6 +269,9 @@ class MainWindow(QMainWindow):
 
         self._game_list.sync_requested.connect(self._on_sync_game)
         self._game_list.exclude_toggled.connect(self._on_exclude_toggled)
+        self._game_list.force_push_requested.connect(self._force_push_game)
+        self._game_list.force_pull_requested.connect(self._on_force_pull_from_context)
+        self._game_list.verify_requested.connect(self._on_verify_game)
 
         for status, btn in self._filter_btns:
             btn.clicked.connect(lambda _checked, s=status: self._on_filter(s))
@@ -349,6 +353,7 @@ class MainWindow(QMainWindow):
             lambda gid, res: self._debug.log_info(f"  sync {gid} → {res.status.name}")
         )
         worker.conflict_detected.connect(self._on_conflict_detected)
+        worker.unknown_detected.connect(self._on_unknown_detected)
         worker.progress.connect(self._on_progress)
         worker.finished.connect(lambda: self._set_status("Sync complete"))
         worker.finished.connect(lambda: self._debug.log_info("Sync All complete"))
@@ -394,6 +399,7 @@ class MainWindow(QMainWindow):
             lambda gid, res: self._debug.log_info(f"  sync {gid} → {res.status.name}")
         )
         worker.conflict_detected.connect(self._on_conflict_detected)
+        worker.unknown_detected.connect(self._on_unknown_detected)
         worker.finished.connect(lambda: self._set_status("Sync complete"))
         worker.error.connect(self._on_worker_error)
         self._track_worker(worker)
@@ -503,6 +509,37 @@ class MainWindow(QMainWindow):
         elif choice == ConflictDialog.Choice.KEEP_CLOUD:
             self._force_pull_game(game_id)
         # KEEP_NEITHER → do nothing
+
+    def _on_unknown_detected(self, game_id: str) -> None:
+        """Prompt the user when a game's status is UNKNOWN (no cloud save found)."""
+        if game_id not in self._games:
+            return
+        reply = QMessageBox.question(
+            self,
+            f"No cloud save — {game_id}",
+            f"No existing cloud save was found for '{game_id}'.\n\n"
+            "Would you like to push your local save to the cloud?\n"
+            "(Choose 'No' to skip this game.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._force_push_game(game_id)
+        else:
+            self._debug.log_info(f"Skipped UNKNOWN game '{game_id}' — user chose not to push")
+
+    def _on_force_pull_from_context(self, game_id: str) -> None:
+        """Handle force-pull request from game card context menu."""
+        self._force_pull_game(game_id)
+
+    def _on_verify_game(self, game_id: str) -> None:
+        """Verify cloud integrity for a game and show result."""
+        ok, msg = self._engine.verify_cloud_integrity(game_id)
+        self._debug.log_info(f"Verify {game_id}: {msg}")
+        if ok:
+            QMessageBox.information(self, f"Integrity — {game_id}", msg)
+        else:
+            QMessageBox.warning(self, f"Integrity — {game_id}", msg)
 
     def _force_push_game(self, game_id: str) -> None:
         """Force-push a single game (used after conflict resolution)."""

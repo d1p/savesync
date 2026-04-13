@@ -21,6 +21,8 @@ class AppConfig:
     rclone_path: str | None = None
     known_games: list[str] = field(default_factory=list)
     excluded_games: list[str] = field(default_factory=list)
+    machine_name: str = ""  # human-readable machine identifier
+    max_versions: int = 3  # number of backup versions to retain per game
 
 
 def default_config_dir() -> Path:
@@ -72,6 +74,8 @@ def load_config(config_dir: Path | None = None) -> AppConfig:
         rclone_path=data.get("rclone_path"),
         known_games=list(data.get("known_games", [])),
         excluded_games=list(data.get("excluded_games", [])),
+        machine_name=data.get("machine_name", ""),
+        max_versions=int(data.get("max_versions", 3)),
     )
 
 
@@ -123,4 +127,7 @@ def _to_toml(cfg: AppConfig) -> str:
         lines.append(f"rclone_path = {_toml_str(cfg.rclone_path)}")
     lines.append(f"known_games = {_toml_array_of_str(cfg.known_games)}")
     lines.append(f"excluded_games = {_toml_array_of_str(cfg.excluded_games)}")
+    if cfg.machine_name:
+        lines.append(f"machine_name = {_toml_str(cfg.machine_name)}")
+    lines.append(f"max_versions = {cfg.max_versions}")
     return "\n".join(lines) + "\n"

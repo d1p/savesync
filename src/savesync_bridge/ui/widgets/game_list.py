@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -19,6 +20,9 @@ class GameListWidget(QWidget):
 
     sync_requested = Signal(str)
     exclude_toggled = Signal(str, bool)  # game_id, excluded
+    force_push_requested = Signal(str)
+    force_pull_requested = Signal(str)
+    verify_requested = Signal(str)
 
     def __init__(self, parent: object = None) -> None:
         super().__init__(parent)
@@ -47,6 +51,18 @@ class GameListWidget(QWidget):
             "color: #6c7086; font-size: 9pt; background: transparent;"
         )
         header_layout.addWidget(self._count_label)
+
+        self._sort_combo = QComboBox()
+        self._sort_combo.addItems(["Name (A-Z)", "Name (Z-A)", "Last Synced", "Status"])
+        self._sort_combo.setFixedHeight(30)
+        self._sort_combo.setStyleSheet(
+            "QComboBox { font-size: 9pt; padding: 2px 6px; background: #313244; "
+            "color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; }"
+            "QComboBox::drop-down { border: none; }"
+        )
+        self._sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+        header_layout.addWidget(self._sort_combo)
+
         root.addWidget(header)
 
         # ---- Scroll area ----
@@ -94,6 +110,7 @@ class GameListWidget(QWidget):
         self._games: dict[str, Game] = {}
         self._filter: SyncStatus | None = None
         self._search_text: str = ""
+        self._sort_key: str = "Name (A-Z)"
 
     def set_games(self, games: list[Game]) -> None:
         """Replace the entire game list with *games*."""
@@ -107,10 +124,14 @@ class GameListWidget(QWidget):
             card = GameCard(game)
             card.sync_requested.connect(self.sync_requested)
             card.exclude_toggled.connect(self.exclude_toggled)
+            card.force_push_requested.connect(self.force_push_requested)
+            card.force_pull_requested.connect(self.force_pull_requested)
+            card.verify_requested.connect(self.verify_requested)
             self._layout.addWidget(card)
             self._cards[game.id] = card
             self._games[game.id] = game
 
+        self._apply_sort()
         self._apply_filter()
         self._update_empty_state()
 
@@ -151,3 +172,38 @@ class GameListWidget(QWidget):
         has_games = len(self._cards) > 0
         self._empty_state.setVisible(not has_games)
         self._scroll.setVisible(has_games)
+
+    def _on_sort_changed(self, index: int) -> None:
+        self._sort_key = self._sort_combo.currentText()
+        self._apply_sort()
+
+    def _apply_sort(self) -> None:
+        """Re-order card widgets in the layout based on the current sort key."""
+        from datetime import datetime
+
+        status_order = {
+            SyncStatus.CONFLICT: 0,
+            SyncStatus.LOCAL_NEWER: 1,
+            SyncStatus.CLOUD_NEWER: 2,
+            SyncStatus.UNKNOWN: 3,
+            SyncStatus.SYNCED: 4,
+        }
+
+        def sort_key(game_id: str):
+            game = self._games[game_id]
+            if self._sort_key == "Name (Z-A)":
+                return game.name.lower()[::-1]
+            if self._sort_key == "Last Synced":
+                ts = game.local_manifest.timestamp if game.local_manifest else datetime.min
+                return ts
+            if self._sort_key == "Status":
+                return (status_order.get(game.status, 99), game.name.lower())
+            return game.name.lower()  # Name (A-Z) default
+
+        reverse = self._sort_key in ("Last Synced",)
+        sorted_ids = sorted(self._cards, key=sort_key, reverse=reverse)
+
+        for card_id in sorted_ids:
+            card = self._cards[card_id]
+            self._layout.removeWidget(card)
+            self._layout.addWidget(card)

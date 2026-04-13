@@ -6,6 +6,7 @@ import os
 import sys
 import tarfile
 import tempfile
+import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +18,28 @@ from savesync_bridge.core.backup_converter import convert_simple_backup_for_rest
 from savesync_bridge.core.config import AppConfig
 from savesync_bridge.core.exceptions import LudusaviError, RcloneError, SyncError
 from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncMeta, SyncStatus
+
+import logging
+import time
+
+_log = logging.getLogger(__name__)
+
+_RETRY_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 1.0  # seconds
+
+
+def _retry_rclone(func, *, attempts: int = _RETRY_ATTEMPTS) -> None:
+    """Retry an rclone operation with exponential backoff on transient errors."""
+    for attempt in range(attempts):
+        try:
+            func()
+            return
+        except RcloneError:
+            if attempt == attempts - 1:
+                raise
+            delay = _RETRY_BASE_DELAY * (2 ** attempt)
+            _log.warning("rclone error (attempt %d/%d), retrying in %.1fs…", attempt + 1, attempts, delay)
+            time.sleep(delay)
 
 
 @dataclass
@@ -168,6 +191,7 @@ def _build_manifest(
     game_id: str,
     game_dir: Path,
     source_file_times: dict[tuple[str, ...], _SourceFileTimes] | None = None,
+    machine_id: str = "",
 ) -> GameManifest:
     """Compute a GameManifest by hashing all files in *game_dir*."""
     save_files: list[SaveFile] = []
@@ -178,6 +202,7 @@ def _build_manifest(
             continue
         data = f.read_bytes()
         hasher.update(data)
+        file_hash = f"sha256:{hashlib.sha256(data).hexdigest()}"
         stat_result = f.stat()
         modified = datetime.fromtimestamp(stat_result.st_mtime, tz=UTC)
         created = _file_created_at(stat_result)
@@ -194,6 +219,7 @@ def _build_manifest(
                 size=stat_result.st_size,
                 modified=modified,
                 created=created,
+                file_hash=file_hash,
             )
         )
 
@@ -204,6 +230,7 @@ def _build_manifest(
         timestamp=datetime.now(tz=UTC),
         hash=f"sha256:{hasher.hexdigest()}",
         files=tuple(save_files),
+        machine_id=machine_id,
     )
 
 
@@ -238,6 +265,80 @@ class SyncEngine:
 
     def _cloud_prefix(self, game_id: str) -> str:
         return f"{self._config.backup_path}/{game_id}"
+
+    # ------------------------------------------------------------------
+    # Cloud lock helpers
+    # ------------------------------------------------------------------
+    _LOCK_STALE_SECONDS = 300  # 5 minutes
+
+    def _lock_key(self, game_id: str) -> str:
+        return f"{self._cloud_prefix(game_id)}/.lock"
+
+    def _acquire_lock(self, game_id: str) -> None:
+        """Upload a lock file to prevent concurrent syncs from other machines."""
+        key = self._lock_key(game_id)
+        # Check for existing lock
+        try:
+            raw = rclone.read_file(
+                self._config.drive_remote,
+                self._config.drive_root,
+                key,
+                env=self._env,
+                binary=self._rclone_bin,
+                config_file=self._rclone_config_file,
+                report_cli=False,
+            )
+            lock_data = json.loads(raw.decode("utf-8"))
+            lock_ts = datetime.fromisoformat(lock_data.get("timestamp", ""))
+            age = (datetime.now(UTC) - lock_ts).total_seconds()
+            if age < self._LOCK_STALE_SECONDS:
+                owner = lock_data.get("machine", "unknown")
+                raise SyncError(
+                    f"Sync locked by '{owner}' ({int(age)}s ago). "
+                    f"Wait or manually remove the lock."
+                )
+            _log.warning("Stale lock found for %s (%ds old), overriding", game_id, int(age))
+        except RcloneError:
+            pass  # No lock exists — good
+        except (json.JSONDecodeError, ValueError, KeyError):
+            _log.warning("Corrupt lock file for %s, overriding", game_id)
+
+        # Write our lock
+        lock_content = json.dumps({
+            "machine": self._config.machine_name or "unknown",
+            "timestamp": datetime.now(UTC).isoformat(),
+        })
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".lock", delete=False) as f:
+            f.write(lock_content)
+            lock_file = Path(f.name)
+        try:
+            prefix = self._cloud_prefix(game_id)
+            rclone.upload(
+                lock_file,
+                self._config.drive_remote,
+                self._config.drive_root,
+                prefix,
+                env=self._env,
+                binary=self._rclone_bin,
+                config_file=self._rclone_config_file,
+            )
+        finally:
+            lock_file.unlink(missing_ok=True)
+
+    def _release_lock(self, game_id: str) -> None:
+        """Remove the lock file from cloud."""
+        key = self._lock_key(game_id)
+        try:
+            rclone.delete_path(
+                self._config.drive_remote,
+                self._config.drive_root,
+                key,
+                env=self._env,
+                binary=self._rclone_bin,
+                config_file=self._rclone_config_file,
+            )
+        except RcloneError:
+            _log.warning("Could not release lock for %s", game_id)
 
     def update_config(self, config: AppConfig) -> None:
         self._config = config
@@ -306,6 +407,124 @@ class SyncEngine:
         except LudusaviError:
             return False, None
 
+    def _rotate_versions(self, game_id: str, prefix: str) -> None:
+        """Rotate backup versions, keeping at most ``max_versions`` old snapshots."""
+        max_versions = self._config.max_versions
+        if max_versions <= 0:
+            return
+
+        versions_prefix = f"{prefix}/versions"
+        try:
+            existing = rclone.list_files(
+                self._config.drive_remote,
+                self._config.drive_root,
+                versions_prefix,
+                env=self._env,
+                binary=self._rclone_bin,
+                config_file=self._rclone_config_file,
+            )
+        except RcloneError:
+            existing = []
+
+        # Each version is stored as versions/v<N>/<file>
+        version_nums: list[int] = []
+        for entry in existing:
+            name = entry.get("Path", entry) if isinstance(entry, dict) else str(entry)
+            parts = name.replace("\\", "/").split("/")
+            for part in parts:
+                if part.startswith("v") and part[1:].isdigit():
+                    version_nums.append(int(part[1:]))
+                    break
+
+        next_version = max(version_nums, default=0) + 1
+
+        # Copy current live files to a versioned slot
+        try:
+            current_meta = self._get_cloud_sync_meta(game_id)
+            if current_meta is not None:
+                dest_prefix = f"{versions_prefix}/v{next_version}"
+                for fname in ("save.tar.gz", "manifest.json", "sync_meta.json"):
+                    src_key = f"{prefix}/{fname}"
+                    try:
+                        data = rclone.read_file(
+                            self._config.drive_remote,
+                            self._config.drive_root,
+                            src_key,
+                            env=self._env,
+                            binary=self._rclone_bin,
+                            config_file=self._rclone_config_file,
+                            report_cli=False,
+                        )
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{fname}") as tmp:
+                            tmp.write(data)
+                            tmp_path = Path(tmp.name)
+                        try:
+                            rclone.upload(
+                                tmp_path,
+                                self._config.drive_remote,
+                                self._config.drive_root,
+                                dest_prefix,
+                                env=self._env,
+                                binary=self._rclone_bin,
+                                config_file=self._rclone_config_file,
+                            )
+                        finally:
+                            tmp_path.unlink(missing_ok=True)
+                    except RcloneError:
+                        pass
+        except Exception:
+            pass
+
+        # Prune excess versions (keep newest max_versions)
+        unique_versions = sorted(set(version_nums + [next_version]))
+        if len(unique_versions) > max_versions:
+            to_delete = unique_versions[:len(unique_versions) - max_versions]
+            for vnum in to_delete:
+                try:
+                    rclone.delete_path(
+                        self._config.drive_remote,
+                        self._config.drive_root,
+                        f"{versions_prefix}/v{vnum}",
+                        env=self._env,
+                        binary=self._rclone_bin,
+                        config_file=self._rclone_config_file,
+                    )
+                except (RcloneError, AttributeError):
+                    pass  # delete_path may not exist yet; will be added
+
+    def _log_history(
+        self, game_id: str, action: str, *, error: str | None = None, confidence: float | None = None,
+    ) -> None:
+        """Append an entry to the sync history log."""
+        try:
+            entry = manifest_module.SyncHistoryEntry(
+                timestamp=datetime.now(tz=UTC).isoformat(),
+                game_id=game_id,
+                action=action,
+                machine_id=self._config.machine_name,
+                confidence=confidence,
+                error=error,
+            )
+            manifest_module.append_sync_history(self._state_dir, entry)
+        except Exception:
+            pass  # history logging should never break sync
+
+    def verify_cloud_integrity(self, game_id: str) -> tuple[bool, str]:
+        """Verify cloud archive integrity by comparing manifest hash.
+
+        Returns (ok, message).
+        """
+        try:
+            cloud_manifest = self.get_cloud_manifest(game_id)
+            cloud_meta = self._get_cloud_sync_meta(game_id)
+            if cloud_manifest is None or cloud_meta is None:
+                return False, "Missing cloud manifest or sync metadata"
+            if cloud_manifest.hash != cloud_meta.hash:
+                return False, f"Hash mismatch: manifest={cloud_manifest.hash}, meta={cloud_meta.hash}"
+            return True, f"Integrity OK — hash {cloud_meta.hash}"
+        except Exception as exc:
+            return False, f"Verification error: {exc}"
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -350,7 +569,15 @@ class SyncEngine:
         The save files are compressed into a tar.gz archive before uploading.
         A lightweight sync_meta.json is uploaded alongside for fast status checks.
         The full manifest.json is also uploaded for backward compatibility.
+        Older versions are retained up to ``config.max_versions``.
         """
+        try:
+            self._acquire_lock(game_id)
+        except SyncError:
+            raise
+        except Exception:
+            pass  # Lock failure should not block sync
+
         try:
             try:
                 source_game = self._live_source_game(game_id)
@@ -373,6 +600,7 @@ class SyncEngine:
                     game_id,
                     game_dir,
                     source_file_times=source_file_times,
+                    machine_id=self._config.machine_name,
                 )
 
                 # 3. Compress save files into archive
@@ -394,6 +622,7 @@ class SyncEngine:
                     compressed=True,
                     archive_name=archive_name,
                     total_size=archive_size,
+                    machine_id=self._config.machine_name,
                 )
                 meta_file = staging_path / "sync_meta.json"
                 meta_file.write_text(
@@ -402,8 +631,11 @@ class SyncEngine:
 
                 prefix = self._cloud_prefix(game_id)
 
+                # 5b. Rotate old versions before uploading new one
+                self._rotate_versions(game_id, prefix)
+
                 # 6. Upload compressed archive (single file instead of many)
-                rclone.upload(
+                _retry_rclone(lambda: rclone.upload(
                     archive_path,
                     self._config.drive_remote,
                     self._config.drive_root,
@@ -411,10 +643,10 @@ class SyncEngine:
                     env=self._env,
                     binary=self._rclone_bin,
                     config_file=self._rclone_config_file,
-                )
+                ))
 
                 # 7. Upload manifest.json
-                rclone.upload(
+                _retry_rclone(lambda: rclone.upload(
                     manifest_file,
                     self._config.drive_remote,
                     self._config.drive_root,
@@ -422,10 +654,10 @@ class SyncEngine:
                     env=self._env,
                     binary=self._rclone_bin,
                     config_file=self._rclone_config_file,
-                )
+                ))
 
                 # 8. Upload sync_meta.json
-                rclone.upload(
+                _retry_rclone(lambda: rclone.upload(
                     meta_file,
                     self._config.drive_remote,
                     self._config.drive_root,
@@ -433,11 +665,15 @@ class SyncEngine:
                     env=self._env,
                     binary=self._rclone_bin,
                     config_file=self._rclone_config_file,
-                )
+                ))
 
                 # 9. Persist manifest locally so check_status can diff later
                 self._save_local_manifest(m)
 
+                # 10. Log sync history
+                self._log_history(game_id, "push")
+
+                self._release_lock(game_id)
                 return SyncResult(
                     game_id=game_id,
                     status=SyncStatus.SYNCED,
@@ -445,6 +681,8 @@ class SyncEngine:
                 )
 
         except (LudusaviError, RcloneError, SyncError) as exc:
+            self._release_lock(game_id)
+            self._log_history(game_id, "push", error=str(exc))
             return SyncResult(game_id=game_id, status=SyncStatus.UNKNOWN, error=str(exc))
 
     def pull(
@@ -458,6 +696,13 @@ class SyncEngine:
 
         Supports both compressed archives (v2+) and legacy uncompressed saves.
         """
+        try:
+            self._acquire_lock(game_id)
+        except SyncError:
+            raise
+        except Exception:
+            pass  # Lock failure should not block sync
+
         try:
             with tempfile.TemporaryDirectory() as staging:
                 staging_path = Path(staging)
@@ -529,9 +774,14 @@ class SyncEngine:
                 # Cache the cloud manifest locally
                 self._save_local_manifest(manifest)
 
+                self._log_history(game_id, "pull")
+
+                self._release_lock(game_id)
                 return SyncResult(game_id=game_id, status=SyncStatus.SYNCED)
 
         except (LudusaviError, RcloneError, SyncError) as exc:
+            self._release_lock(game_id)
+            self._log_history(game_id, "pull", error=str(exc))
             return SyncResult(game_id=game_id, status=SyncStatus.UNKNOWN, error=str(exc))
 
     def check_status(self, game_id: str, *, use_live_local: bool = False) -> SyncResult:
@@ -626,8 +876,12 @@ class SyncEngine:
                 save_dir_stat=dir_stat,
             )
 
-        if status_result.status in (SyncStatus.LOCAL_NEWER, SyncStatus.UNKNOWN):
+        if status_result.status in (SyncStatus.LOCAL_NEWER,):
             return self.push(game_id)
+
+        if status_result.status == SyncStatus.UNKNOWN:
+            # Don't auto-push UNKNOWN — return it so the UI can prompt the user
+            return status_result
 
         if status_result.status == SyncStatus.CLOUD_NEWER:
             cloud = self.get_cloud_manifest(game_id)
@@ -645,3 +899,126 @@ class SyncEngine:
             )
 
         return status_result
+
+    # ------------------------------------------------------------------
+    # Export / Import backup library
+    # ------------------------------------------------------------------
+
+    def list_cloud_games(self) -> list[str]:
+        """Return game IDs that have saves stored in the cloud."""
+        try:
+            entries = rclone.list_files(
+                self._config.drive_remote,
+                self._config.drive_root,
+                self._config.backup_path,
+                env=self._env,
+                binary=self._rclone_bin,
+                config_file=self._rclone_config_file,
+            )
+            return [
+                e["Path"] for e in entries
+                if e.get("IsDir", False)
+            ]
+        except RcloneError:
+            return []
+
+    def export_library(self, dest: Path, game_ids: list[str] | None = None) -> Path:
+        """Download cloud saves and bundle them into a zip at *dest*.
+
+        Args:
+            dest: Path for the output .zip file.
+            game_ids: Games to include. ``None`` means all cloud games.
+
+        Returns:
+            The resolved path of the created zip file.
+
+        Raises:
+            SyncError: If no games are found or export fails.
+        """
+        if game_ids is None:
+            game_ids = self.list_cloud_games()
+        if not game_ids:
+            raise SyncError("No games found in cloud to export")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            for gid in game_ids:
+                prefix = self._cloud_prefix(gid)
+                game_dir = tmp_path / gid
+                game_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    rclone.download(
+                        self._config.drive_remote,
+                        self._config.drive_root,
+                        prefix,
+                        game_dir,
+                        env=self._env,
+                        binary=self._rclone_bin,
+                        config_file=self._rclone_config_file,
+                    )
+                except RcloneError as exc:
+                    _log.warning("Skipping %s during export: %s", gid, exc)
+
+            dest = dest.resolve()
+            with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, _dirs, files in os.walk(tmp_path):
+                    for fn in files:
+                        full = Path(root) / fn
+                        arcname = full.relative_to(tmp_path).as_posix()
+                        zf.write(full, arcname)
+
+        _log.info("Exported %d game(s) to %s", len(game_ids), dest)
+        return dest
+
+    def import_library(self, src: Path, game_ids: list[str] | None = None) -> list[str]:
+        """Restore cloud saves from a zip file created by :meth:`export_library`.
+
+        Args:
+            src: Path to the .zip file.
+            game_ids: Games to restore. ``None`` means all games in the zip.
+
+        Returns:
+            List of game IDs that were restored.
+
+        Raises:
+            SyncError: If the zip is invalid or import fails.
+        """
+        if not src.is_file():
+            raise SyncError(f"Import file not found: {src}")
+
+        restored: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with zipfile.ZipFile(src, "r") as zf:
+                zf.extractall(tmp_path)
+
+            # Each top-level directory is a game_id
+            for entry in sorted(tmp_path.iterdir()):
+                if not entry.is_dir():
+                    continue
+                gid = entry.name
+                if game_ids is not None and gid not in game_ids:
+                    continue
+
+                prefix = self._cloud_prefix(gid)
+                # Upload each file inside the game directory
+                for fpath in entry.rglob("*"):
+                    if not fpath.is_file():
+                        continue
+                    try:
+                        _retry_rclone(lambda fp=fpath, p=prefix: rclone.upload(
+                            fp,
+                            self._config.drive_remote,
+                            self._config.drive_root,
+                            p,
+                            env=self._env,
+                            binary=self._rclone_bin,
+                            config_file=self._rclone_config_file,
+                        ))
+                    except RcloneError as exc:
+                        _log.warning("Failed to upload %s: %s", fpath.name, exc)
+                        continue
+                restored.append(gid)
+
+        _log.info("Imported %d game(s) from %s", len(restored), src)
+        return restored

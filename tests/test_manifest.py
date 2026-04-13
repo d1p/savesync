@@ -9,6 +9,7 @@ from savesync_bridge.core.manifest import (
     compare,
     compare_meta,
     compute_confidence,
+    diff_manifests,
     from_json,
     latest_modified,
     oldest_known_created,
@@ -16,8 +17,13 @@ from savesync_bridge.core.manifest import (
     sync_meta_from_json,
     sync_meta_to_json,
     to_json,
+    append_sync_history,
+    load_sync_history,
     AUTO_SYNC_CONFIDENCE_THRESHOLD,
     ConfidenceResult,
+    FileDiffEntry,
+    ManifestDiff,
+    SyncHistoryEntry,
 )
 from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncMeta, SyncStatus
 
@@ -376,3 +382,175 @@ def test_confidence_dir_scan_contradicts_lowers_score() -> None:
     # With contradicting dir scan (local dir files are NEWER than cloud creation)
     low = compute_confidence(local, cloud, local_dir_oldest_created=_T_RECENT, local_dir_file_count=3)
     assert high.score > low.score
+
+
+# ---------------------------------------------------------------------------
+# Per-file hash round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_round_trip_preserves_file_hash() -> None:
+    sf = SaveFile(path="save.dat", size=512, modified=_T0, file_hash="sha256:abc123")
+    m = _manifest(files=(sf,))
+    json_str = to_json(m)
+    restored = from_json(json_str)
+    assert restored.files[0].file_hash == "sha256:abc123"
+
+
+def test_round_trip_preserves_none_file_hash() -> None:
+    sf = SaveFile(path="save.dat", size=512, modified=_T0)
+    m = _manifest(files=(sf,))
+    json_str = to_json(m)
+    restored = from_json(json_str)
+    assert restored.files[0].file_hash is None
+
+
+# ---------------------------------------------------------------------------
+# Machine ID round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_round_trip_preserves_machine_id() -> None:
+    m = GameManifest(
+        game_id="Celeste", host=Platform.WINDOWS, timestamp=_T0,
+        hash="sha256:abc", files=(), machine_id="desktop-win",
+    )
+    json_str = to_json(m)
+    restored = from_json(json_str)
+    assert restored.machine_id == "desktop-win"
+
+
+def test_round_trip_machine_id_defaults_empty() -> None:
+    m = _manifest()
+    json_str = to_json(m)
+    restored = from_json(json_str)
+    assert restored.machine_id == ""
+
+
+def test_sync_meta_round_trip_machine_id() -> None:
+    meta = SyncMeta(
+        game_id="Celeste", hash="sha256:abc", timestamp=_T0,
+        compressed=True, archive_name="save.tar.gz", total_size=1024,
+        machine_id="deck-linux",
+    )
+    json_str = sync_meta_to_json(meta)
+    restored = sync_meta_from_json(json_str)
+    assert restored.machine_id == "deck-linux"
+
+
+# ---------------------------------------------------------------------------
+# Per-file diff
+# ---------------------------------------------------------------------------
+
+
+def test_diff_manifests_identical_files() -> None:
+    sf = SaveFile(path="save.dat", size=512, modified=_T0, file_hash="sha256:same")
+    local = _manifest(files=(sf,))
+    cloud = _manifest(files=(sf,))
+    diff = diff_manifests(local, cloud)
+    assert diff.total_files == 1
+    assert diff.unchanged_count == 1
+    assert diff.modified_count == 0
+
+
+def test_diff_manifests_modified_file() -> None:
+    local_f = SaveFile(path="save.dat", size=512, modified=_T0, file_hash="sha256:aaa")
+    cloud_f = SaveFile(path="save.dat", size=600, modified=_T1, file_hash="sha256:bbb")
+    local = _manifest(files=(local_f,))
+    cloud = _manifest(files=(cloud_f,))
+    diff = diff_manifests(local, cloud)
+    assert diff.modified_count == 1
+    assert diff.entries[0].status == "modified"
+
+
+def test_diff_manifests_added_local() -> None:
+    sf = SaveFile(path="new.dat", size=100, modified=_T0, file_hash="sha256:new")
+    local = _manifest(files=(sf,))
+    cloud = _manifest(files=())
+    diff = diff_manifests(local, cloud)
+    assert diff.added_local_count == 1
+    assert diff.entries[0].status == "added_local"
+
+
+def test_diff_manifests_added_cloud() -> None:
+    sf = SaveFile(path="cloud.dat", size=100, modified=_T0, file_hash="sha256:cloud")
+    local = _manifest(files=())
+    cloud = _manifest(files=(sf,))
+    diff = diff_manifests(local, cloud)
+    assert diff.added_cloud_count == 1
+    assert diff.entries[0].status == "added_cloud"
+
+
+def test_diff_manifests_fallback_size_when_no_hash() -> None:
+    local_f = SaveFile(path="save.dat", size=512, modified=_T0)
+    cloud_f = SaveFile(path="save.dat", size=512, modified=_T1)
+    local = _manifest(files=(local_f,))
+    cloud = _manifest(files=(cloud_f,))
+    diff = diff_manifests(local, cloud)
+    assert diff.unchanged_count == 1  # same size → assumed unchanged
+
+
+def test_diff_manifests_size_difference_counts_as_modified() -> None:
+    local_f = SaveFile(path="save.dat", size=512, modified=_T0)
+    cloud_f = SaveFile(path="save.dat", size=600, modified=_T1)
+    local = _manifest(files=(local_f,))
+    cloud = _manifest(files=(cloud_f,))
+    diff = diff_manifests(local, cloud)
+    assert diff.modified_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Confidence scoring with per-file content match signal
+# ---------------------------------------------------------------------------
+
+
+def test_confidence_includes_content_match_reason() -> None:
+    local = _manifest(
+        hash_="sha256:local",
+        files=(SaveFile(path="save.dat", size=512, modified=_T_RECENT, created=_T_OLD, file_hash="sha256:same"),),
+    )
+    cloud = _manifest(
+        hash_="sha256:cloud",
+        files=(SaveFile(path="save.dat", size=512, modified=_T_RECENT, created=_T_RECENT, file_hash="sha256:same"),),
+    )
+    result = compute_confidence(local, cloud)
+    content_reasons = [r for r in result.reasons if "identical content" in r]
+    assert len(content_reasons) > 0
+
+
+# ---------------------------------------------------------------------------
+# Sync history
+# ---------------------------------------------------------------------------
+
+
+def test_sync_history_append_and_load(tmp_path) -> None:
+    entry = SyncHistoryEntry(
+        timestamp="2026-01-01T00:00:00",
+        game_id="Celeste",
+        action="push",
+        machine_id="desktop",
+    )
+    append_sync_history(tmp_path, entry)
+    loaded = load_sync_history(tmp_path)
+    assert len(loaded) == 1
+    assert loaded[0].game_id == "Celeste"
+    assert loaded[0].action == "push"
+    assert loaded[0].machine_id == "desktop"
+
+
+def test_sync_history_limits_entries(tmp_path) -> None:
+    for i in range(10):
+        entry = SyncHistoryEntry(
+            timestamp=f"2026-01-01T00:00:{i:02d}",
+            game_id=f"Game{i}",
+            action="push",
+        )
+        append_sync_history(tmp_path, entry, max_entries=5)
+    loaded = load_sync_history(tmp_path)
+    assert len(loaded) == 5
+    assert loaded[0].game_id == "Game5"
+
+
+def test_sync_history_empty_when_missing(tmp_path) -> None:
+    loaded = load_sync_history(tmp_path)
+    assert loaded == []

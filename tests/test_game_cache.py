@@ -4,7 +4,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from savesync_bridge.core.game_cache import load_games, save_games
+from savesync_bridge.core.game_cache import load_games, prune_stale_games, save_games
 from savesync_bridge.core.manifest import to_json
 from savesync_bridge.models.game import Game, GameManifest, Platform, SaveFile
 
@@ -62,3 +62,34 @@ def test_save_and_load_preserves_excluded(tmp_path: Path) -> None:
     loaded = load_games(tmp_path)
     assert loaded[0].excluded is True
     assert loaded[1].excluded is False
+
+
+def test_prune_stale_games_removes_missing_paths(tmp_path: Path) -> None:
+    existing = tmp_path / "existing_save"
+    existing.mkdir()
+    games = [
+        Game(id="Active", name="Active", save_paths=(str(existing),)),
+        Game(id="Stale", name="Stale", save_paths=(str(tmp_path / "nonexistent"),)),
+    ]
+    active, pruned = prune_stale_games(games)
+    assert len(active) == 1
+    assert active[0].id == "Active"
+    assert pruned == ["Stale"]
+
+
+def test_prune_stale_games_keeps_no_path_games() -> None:
+    games = [Game(id="CloudOnly", name="CloudOnly", save_paths=())]
+    active, pruned = prune_stale_games(games)
+    assert len(active) == 1
+    assert pruned == []
+
+
+def test_prune_stale_games_keeps_if_any_path_exists(tmp_path: Path) -> None:
+    existing = tmp_path / "path_a"
+    existing.mkdir()
+    games = [
+        Game(id="G1", name="G1", save_paths=(str(existing), str(tmp_path / "nope"))),
+    ]
+    active, pruned = prune_stale_games(games)
+    assert len(active) == 1
+    assert pruned == []

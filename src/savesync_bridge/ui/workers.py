@@ -33,10 +33,12 @@ class SyncWorker(QThread):
     """Runs ``SyncEngine.sync()`` for one or more games in a background thread.
 
     Emits ``conflict_detected`` when a game has conflicting saves on both sides.
+    Emits ``unknown_detected`` when a game's status is UNKNOWN (no cloud save).
     """
 
     game_updated = Signal(str, object)  # game_id, SyncResult
     conflict_detected = Signal(str, object, object, object)  # game_id, local_manifest, cloud_manifest, confidence
+    unknown_detected = Signal(str)  # game_id — no cloud save, needs user decision
     progress = Signal(int, int)  # done, total
     finished = Signal()
     error = Signal(str)
@@ -73,6 +75,8 @@ class SyncWorker(QThread):
                     local = result.local_manifest or self._engine.get_local_manifest(game_id)
                     cloud = result.cloud_manifest or self._engine.get_cloud_manifest(game_id)
                     self.conflict_detected.emit(game_id, local, cloud, result.confidence)
+                elif result.status == SyncStatus.UNKNOWN and not result.error:
+                    self.unknown_detected.emit(game_id)
                 else:
                     self.game_updated.emit(game_id, result)
                 self.progress.emit(done, total)

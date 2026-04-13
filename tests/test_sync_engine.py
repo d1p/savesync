@@ -584,3 +584,186 @@ class TestScanSaveDirectories:
         stat = scan_save_directories([str(empty)])
         assert stat.total_files == 0
         assert stat.total_size == 0
+
+
+# ---------------------------------------------------------------------------
+# sync — UNKNOWN status does not auto-push
+# ---------------------------------------------------------------------------
+
+
+class TestSyncUnknownNoAutoPush:
+    def test_unknown_returns_unknown_instead_of_pushing(self, engine: SyncEngine) -> None:
+        """When check_status returns UNKNOWN (no cloud save), sync returns UNKNOWN without auto-pushing."""
+        unknown = SyncResult(GAME_ID, SyncStatus.UNKNOWN)
+        with (
+            patch.object(engine, "check_status", return_value=unknown),
+            patch.object(engine, "push") as mock_push,
+        ):
+            result = engine.sync(GAME_ID)
+        mock_push.assert_not_called()
+        assert result.status == SyncStatus.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# verify_cloud_integrity
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyCloudIntegrity:
+    def test_ok_when_hashes_match(self, engine: SyncEngine) -> None:
+        m = _make_manifest(content_hash="sha256:abc123")
+        meta = SyncMeta(
+            game_id=GAME_ID, hash="sha256:abc123",
+            timestamp=datetime(2026, 4, 12, 10, 0, 0, tzinfo=UTC),
+            compressed=True, archive_name="save.tar.gz", total_size=1024,
+        )
+        with (
+            patch.object(engine, "get_cloud_manifest", return_value=m),
+            patch.object(engine, "_get_cloud_sync_meta", return_value=meta),
+        ):
+            ok, msg = engine.verify_cloud_integrity(GAME_ID)
+        assert ok is True
+        assert "OK" in msg
+
+    def test_fails_when_hashes_differ(self, engine: SyncEngine) -> None:
+        m = _make_manifest(content_hash="sha256:aaa")
+        meta = SyncMeta(
+            game_id=GAME_ID, hash="sha256:bbb",
+            timestamp=datetime(2026, 4, 12, 10, 0, 0, tzinfo=UTC),
+        )
+        with (
+            patch.object(engine, "get_cloud_manifest", return_value=m),
+            patch.object(engine, "_get_cloud_sync_meta", return_value=meta),
+        ):
+            ok, msg = engine.verify_cloud_integrity(GAME_ID)
+        assert ok is False
+        assert "mismatch" in msg.lower()
+
+    def test_fails_when_manifest_missing(self, engine: SyncEngine) -> None:
+        with (
+            patch.object(engine, "get_cloud_manifest", return_value=None),
+            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
+        ):
+            ok, msg = engine.verify_cloud_integrity(GAME_ID)
+        assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# Export / Import backup library
+# ---------------------------------------------------------------------------
+
+
+class TestExportImport:
+    def test_list_cloud_games(self, engine: SyncEngine) -> None:
+        entries = [
+            {"Path": "Hades", "IsDir": True},
+            {"Path": "Celeste", "IsDir": True},
+            {"Path": "manifest.json", "IsDir": False},
+        ]
+        with patch("savesync_bridge.cli.rclone.list_files", return_value=entries):
+            result = engine.list_cloud_games()
+        assert result == ["Hades", "Celeste"]
+
+    def test_list_cloud_games_handles_rclone_error(self, engine: SyncEngine) -> None:
+        with patch("savesync_bridge.cli.rclone.list_files", side_effect=RcloneError("fail", 1, "")):
+            result = engine.list_cloud_games()
+        assert result == []
+
+    def test_export_creates_zip(self, engine: SyncEngine, tmp_path: Path) -> None:
+        dest = tmp_path / "backup.zip"
+
+        def fake_download(_remote, _root, _prefix, local_path, **kw):
+            (local_path / "save.tar.gz").write_bytes(b"fake archive data")
+
+        with (
+            patch("savesync_bridge.cli.rclone.download", side_effect=fake_download),
+        ):
+            result = engine.export_library(dest, game_ids=["Hades"])
+
+        assert result == dest.resolve()
+        assert dest.exists()
+        import zipfile
+        with zipfile.ZipFile(dest, "r") as zf:
+            names = zf.namelist()
+        assert "Hades/save.tar.gz" in names
+
+    def test_export_raises_on_empty(self, engine: SyncEngine, tmp_path: Path) -> None:
+        from savesync_bridge.core.exceptions import SyncError
+        dest = tmp_path / "backup.zip"
+        with pytest.raises(SyncError, match="No games found"):
+            engine.export_library(dest, game_ids=[])
+
+    def test_import_restores_files(self, engine: SyncEngine, tmp_path: Path) -> None:
+        # Create a zip with a fake game save
+        import zipfile
+        src = tmp_path / "backup.zip"
+        with zipfile.ZipFile(src, "w") as zf:
+            zf.writestr("Hades/save.tar.gz", b"fake data")
+            zf.writestr("Hades/manifest.json", '{"fake": true}')
+
+        uploaded = []
+
+        def fake_upload(local_file, _remote, _root, _prefix, **kw):
+            uploaded.append(local_file.name)
+
+        with patch("savesync_bridge.cli.rclone.upload", side_effect=fake_upload):
+            result = engine.import_library(src)
+
+        assert "Hades" in result
+        assert "save.tar.gz" in uploaded
+        assert "manifest.json" in uploaded
+
+    def test_import_raises_on_missing_file(self, engine: SyncEngine, tmp_path: Path) -> None:
+        from savesync_bridge.core.exceptions import SyncError
+        with pytest.raises(SyncError, match="not found"):
+            engine.import_library(tmp_path / "nonexistent.zip")
+
+
+# ---------------------------------------------------------------------------
+# Cloud lock
+# ---------------------------------------------------------------------------
+
+
+class TestCloudLock:
+    def test_acquire_lock_succeeds_when_no_lock(self, engine: SyncEngine) -> None:
+        """Lock acquisition succeeds when no existing lock."""
+        with (
+            patch("savesync_bridge.cli.rclone.read_file", side_effect=RcloneError("not found", 1, "")),
+            patch("savesync_bridge.cli.rclone.upload") as mock_upload,
+        ):
+            engine._acquire_lock(GAME_ID)
+        mock_upload.assert_called_once()
+
+    def test_acquire_lock_fails_when_active(self, engine: SyncEngine) -> None:
+        """Lock acquisition raises SyncError when another machine holds a fresh lock."""
+        import json
+        from savesync_bridge.core.exceptions import SyncError
+        lock_data = json.dumps({
+            "machine": "other-pc",
+            "timestamp": datetime.now(UTC).isoformat(),
+        }).encode("utf-8")
+        with (
+            patch("savesync_bridge.cli.rclone.read_file", return_value=lock_data),
+            pytest.raises(SyncError, match="locked by"),
+        ):
+            engine._acquire_lock(GAME_ID)
+
+    def test_acquire_lock_overrides_stale(self, engine: SyncEngine) -> None:
+        """Stale locks (>5 min) are overridden."""
+        import json
+        old_ts = datetime(2020, 1, 1, tzinfo=UTC).isoformat()
+        lock_data = json.dumps({
+            "machine": "old-pc",
+            "timestamp": old_ts,
+        }).encode("utf-8")
+        with (
+            patch("savesync_bridge.cli.rclone.read_file", return_value=lock_data),
+            patch("savesync_bridge.cli.rclone.upload") as mock_upload,
+        ):
+            engine._acquire_lock(GAME_ID)
+        mock_upload.assert_called_once()
+
+    def test_release_lock(self, engine: SyncEngine) -> None:
+        with patch("savesync_bridge.cli.rclone.delete_path") as mock_delete:
+            engine._release_lock(GAME_ID)
+        mock_delete.assert_called_once()

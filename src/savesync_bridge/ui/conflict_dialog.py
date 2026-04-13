@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
 )
 
@@ -146,6 +147,12 @@ class ConflictDialog(QDialog):
         panels_row.addWidget(cloud_panel, stretch=1)
         layout.addLayout(panels_row)
 
+        # Per-file diff section
+        diff = manifest_module.diff_manifests(local_manifest, cloud_manifest)
+        if diff.total_files > 0:
+            diff_frame = self._make_diff_panel(diff)
+            layout.addWidget(diff_frame)
+
         # Action buttons
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
@@ -216,6 +223,9 @@ class ConflictDialog(QDialog):
         layout.addWidget(self._dim_label(f"📁  {len(manifest.files)} file(s)"))
         layout.addWidget(self._dim_label(f"💾  {_format_size(_total_size(manifest))}"))
 
+        if manifest.machine_id:
+            layout.addWidget(self._dim_label(f"🖥  From: {manifest.machine_id}"))
+
         # Show up to 3 files with timestamps
         for sf in list(manifest.files)[:3]:
             file_detail = f"  • {sf.path}  ({_format_size(sf.size)})"
@@ -237,6 +247,79 @@ class ConflictDialog(QDialog):
             layout.addWidget(more)
 
         layout.addStretch()
+        return frame
+
+    def _make_diff_panel(self, diff: manifest_module.ManifestDiff) -> QFrame:
+        """Build a collapsible per-file diff view."""
+        frame = QFrame()
+        frame.setObjectName("diff_panel")
+        frame.setFrameShape(QFrame.Shape.StyledPanel)
+        frame.setStyleSheet(
+            "QFrame#diff_panel {"
+            f"  background-color: {DARK_PALETTE['surface0']};"
+            f"  border: 1px solid {DARK_PALETTE['surface1']};"
+            "  border-radius: 8px;"
+            "}"
+        )
+
+        outer = QVBoxLayout(frame)
+        outer.setContentsMargins(12, 10, 12, 10)
+        outer.setSpacing(4)
+
+        summary_parts: list[str] = []
+        if diff.unchanged_count:
+            summary_parts.append(f"{diff.unchanged_count} unchanged")
+        if diff.modified_count:
+            summary_parts.append(f"{diff.modified_count} modified")
+        if diff.added_local_count:
+            summary_parts.append(f"{diff.added_local_count} local-only")
+        if diff.added_cloud_count:
+            summary_parts.append(f"{diff.added_cloud_count} cloud-only")
+
+        header = QLabel(f"📋  File Differences — {', '.join(summary_parts)}")
+        header.setStyleSheet(
+            f"font-size: 10pt; font-weight: 600; color: {DARK_PALETTE['text']}; background: transparent;"
+        )
+        outer.addWidget(header)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMaximumHeight(160)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
+        container = QFrame()
+        container.setStyleSheet("background: transparent;")
+        diff_layout = QVBoxLayout(container)
+        diff_layout.setContentsMargins(0, 4, 0, 0)
+        diff_layout.setSpacing(2)
+
+        status_icons = {
+            "unchanged": ("  ✓", "#a6e3a1"),
+            "modified": ("  ✎", "#f9e2af"),
+            "added_local": ("  + local", "#89b4fa"),
+            "added_cloud": ("  + cloud", "#cba6f7"),
+        }
+
+        for entry in diff.entries:
+            icon, color = status_icons.get(entry.status, ("  ?", DARK_PALETTE["text_dim"]))
+            size_info = ""
+            if entry.local_file and entry.cloud_file and entry.status == "modified":
+                size_info = f"  ({_format_size(entry.local_file.size)} → {_format_size(entry.cloud_file.size)})"
+            elif entry.local_file:
+                size_info = f"  ({_format_size(entry.local_file.size)})"
+            elif entry.cloud_file:
+                size_info = f"  ({_format_size(entry.cloud_file.size)})"
+
+            lbl = QLabel(f"{icon}  {entry.path}{size_info}")
+            lbl.setStyleSheet(
+                f"color: {color}; font-size: 9pt; font-family: monospace; background: transparent;"
+            )
+            diff_layout.addWidget(lbl)
+
+        diff_layout.addStretch()
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
+
         return frame
 
     @staticmethod
