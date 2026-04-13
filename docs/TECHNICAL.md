@@ -1,262 +1,282 @@
 # SaveSync-Bridge Technical Documentation
 
-This document describes the actual implementation in the current codebase, with emphasis on backup flow, sync decisions, replacement behavior, and version comparison.
+This document describes the current implementation in the repository as of v0.3.1, with emphasis on the smart-sync pipeline, cloud storage format, background workers, and restore-time path conversion.
 
 ## Architecture Overview
 
 High-level layers:
 
-- UI layer: PySide6 windows, dialogs, workers
+- UI layer: PySide6 windows, dialogs, widgets, and worker threads
 - Orchestration layer: `SyncEngine`
 - Tool adapters: `cli/ludusavi.py` and `cli/rclone.py`
-- Persistence: config TOML, local manifest cache, remote `manifest.json`
+- Persistence layer: config TOML, local manifest cache, cloud metadata files
 
-Core modules:
+Key modules:
 
+- `src/savesync_bridge/ui/main_window.py`
+- `src/savesync_bridge/ui/workers.py`
 - `src/savesync_bridge/core/sync_engine.py`
+- `src/savesync_bridge/core/backup_converter.py`
 - `src/savesync_bridge/core/manifest.py`
-- `src/savesync_bridge/cli/ludusavi.py`
-- `src/savesync_bridge/cli/rclone.py`
 - `src/savesync_bridge/models/game.py`
+
+## End-To-End Sync Flow
+
+The current app exposes a single sync action per game. The UI does not ask the user to choose push or pull up front.
+
+```mermaid
+flowchart TD
+    A[User clicks Sync or Sync All] --> B[UI worker calls SyncEngine.sync]
+    B --> C[SyncEngine.check_status]
+    C --> D[Read local manifest cache]
+    D --> E[Try cloud sync_meta.json]
+    E --> F{Metadata available?}
+    F -->|Yes| G[Compare local manifest against cloud SyncMeta]
+    F -->|No| H[Fetch cloud manifest.json]
+    H --> I[Compare local and cloud GameManifest]
+    G --> J{Status}
+    I --> J
+    J -->|Synced| K[Return no-op result]
+    J -->|Local newer| L[Push]
+    J -->|Cloud newer| M[Pull]
+    J -->|Conflict| N[Return conflict to UI]
+    J -->|Unknown| O[Push]
+    N --> P[ConflictDialog]
+    P -->|Keep Mine| L
+    P -->|Keep Cloud| M
+    P -->|Cancel| Q[Stop]
+```
+
+## UI Flow And Workers
+
+`MainWindow` coordinates user actions and launches background threads so the GUI stays responsive.
+
+Worker roles:
+
+- `ScanWorker`: runs `list_games()` and returns `LudusaviGame` records
+- `SyncWorker`: runs `SyncEngine.sync()` for one or more games, emits progress and conflict events
+- `PushWorker`: force-pushes one or more games after conflict resolution
+- `PullWorker`: force-pulls one or more games after conflict resolution
+- `FetchCloudManifestWorker`: downloads full cloud manifests before a forced pull
+- `DriveConfigWorker`: performs Google Drive authentication, verification, reconnect, and token removal
+
+The main window also:
+
+- restores cached game cards on launch before scanning
+- persists exclusion choices to `config.toml`
+- attaches local manifests to games so cards can show last sync time
+- updates the backup summary panel based on rclone remote config presence
 
 ## Data Model
 
-## `GameManifest`
+### `GameManifest`
 
-Each snapshot is represented by:
+Represents a full game snapshot:
 
 - `game_id`: Ludusavi game identifier
 - `host`: `windows`, `linux`, or `steam_deck`
-- `timestamp`: UTC timestamp of when the manifest was created
-- `hash`: SHA-256 digest across the staged backup content
+- `timestamp`: UTC time when SaveSync-Bridge created the manifest
+- `hash`: SHA-256 digest over staged file contents
 - `files`: tuple of `SaveFile`
 
 Each `SaveFile` contains:
 
-- `path`: relative path inside the staged game backup
-- `size`: file size in bytes
-- `modified`: file modification time from the staged file
+- `path`: relative path inside the staged backup
+- `size`: bytes
+- `modified`: filesystem modification time captured from the staged file
 
-## Manifest Serialization
+### `SyncMeta`
 
-Implemented in `core/manifest.py`.
+`SyncMeta` is a lightweight cloud-side record used for fast status checks without downloading the full manifest.
 
-- `to_json(manifest)` writes pretty-printed JSON
-- `from_json(data)` reconstructs `GameManifest`
-- `compare(local, cloud)` returns `SyncStatus`
+Fields:
 
-The manifest schema is intentionally small. It stores enough metadata for:
+- `game_id`
+- `hash`
+- `timestamp`
+- `compressed`
+- `archive_name`
+- `total_size`
 
-- snapshot equality checks via `hash`
-- direction decisions via `timestamp`
-- UI display via file counts and sizes
+Current serialization writes `version: 2` into `sync_meta.json`.
 
-## Backup Logic
+## Manifest And Metadata Comparison
+
+Comparison logic is implemented in `core/manifest.py`.
+
+Rules for both `compare()` and `compare_meta()`:
+
+1. Matching hashes return `SYNCED`.
+2. Newer local timestamp returns `LOCAL_NEWER`.
+3. Newer cloud timestamp returns `CLOUD_NEWER`.
+4. Equal timestamps with different hashes return `CONFLICT`.
+
+```mermaid
+flowchart TD
+    A[Compare hashes] --> B{Hashes equal?}
+    B -->|Yes| C[Synced]
+    B -->|No| D{Local timestamp newer?}
+    D -->|Yes| E[Local newer]
+    D -->|No| F{Cloud timestamp newer?}
+    F -->|Yes| G[Cloud newer]
+    F -->|No| H[Conflict]
+```
+
+Important nuance:
+
+- comparison is snapshot-level, not file-level
+- `SaveFile.modified` is informational; it is not used to choose the winner
+
+## `check_status()` Behavior
+
+`SyncEngine.check_status(game_id)` now prefers the lightweight metadata path.
+
+Flow:
+
+```mermaid
+flowchart TD
+    A[Load local manifest] --> B[Fetch cloud sync_meta.json]
+    B --> C{Local and cloud SyncMeta available?}
+    C -->|Yes| D[compare_meta local vs cloud]
+    C -->|No| E[Fetch full cloud manifest]
+    E --> F{Both manifests missing?}
+    F -->|Yes| G[Unknown]
+    F -->|No| H{Cloud missing?}
+    H -->|Yes| I[Local newer]
+    H -->|No| J{Local missing?}
+    J -->|Yes| K[Cloud newer]
+    J -->|No| L[compare local vs cloud]
+```
+
+The fast path is only used when both a local manifest and cloud `sync_meta.json` exist. Otherwise the engine falls back to the full-manifest path for compatibility with older snapshots.
+
+## Push Pipeline
 
 Implemented in `SyncEngine.push()`.
 
 Sequence:
 
 1. Create a temporary staging directory.
-2. Create a per-game subdirectory inside staging.
-3. Run Ludusavi backup for exactly one game into that directory.
-4. Walk all staged files recursively.
-5. Compute a combined SHA-256 hash across file contents.
-6. Build a `GameManifest` with current UTC time.
-7. Write `manifest.json` into the staging root.
-8. Upload the game directory with rclone.
-9. Upload `manifest.json` with rclone.
-10. Save the same manifest into the local state cache.
-
-Flow:
+2. Create a per-game backup folder.
+3. Run Ludusavi backup for exactly one game.
+4. Walk staged files and build a `GameManifest`.
+5. Compress the staged backup into `save.tar.gz`.
+6. Write `manifest.json`.
+7. Write `sync_meta.json`.
+8. Upload archive and metadata files with rclone.
+9. Save the full manifest locally.
 
 ```mermaid
 flowchart TD
-    A[Start push operation] --> B[Create temporary directory]
-    B --> C[Run Ludusavi backup]
-    C --> D[Build manifest from staged files]
-    D --> E[Serialize manifest to json]
-    E --> F[Upload game directory with rclone]
-    F --> G[Upload manifest json with rclone]
-    G --> H[Save local cached manifest]
-    H --> I[Return synced status]
+    A[Create temp staging directory] --> B[Run ludusavi backup]
+    B --> C[Build GameManifest]
+    C --> D[Create save.tar.gz]
+    D --> E[Write manifest.json]
+    E --> F[Write sync_meta.json]
+    F --> G[Upload save.tar.gz]
+    G --> H[Upload manifest.json]
+    H --> I[Upload sync_meta.json]
+    I --> J[Persist local manifest]
 ```
 
-### Exact Ludusavi command used for push
+Exact Ludusavi command:
 
 ```text
 ludusavi backup --api --force --path <staging_game_dir> <game_name>
 ```
 
-`--force` is required because Ludusavi may otherwise request interactive confirmation, which breaks non-interactive GUI execution.
-
-### Important implementation detail
-
-The content hash is built from the staged backup files, not from the original live save locations. This is the correct thing to compare because those staged files are exactly what get uploaded.
-
-## Pull Logic
+## Pull Pipeline
 
 Implemented in `SyncEngine.pull()`.
 
 Sequence:
 
 1. Create a temporary staging directory.
-2. Create a per-game subdirectory.
-3. Download the cloud snapshot into that directory using rclone.
-4. If the snapshot came from Windows and the current machine uses a Wine or Proton prefix, or vice versa, rewrite the staged Ludusavi backup layout and `mapping.yaml` to the target environment's absolute paths.
-5. Run Ludusavi restore for that game from the rewritten staging directory.
-6. Save the cloud manifest into the local state cache.
-
-Flow:
+2. Try to fetch cloud `sync_meta.json`.
+3. If the snapshot is compressed, download `save.tar.gz` and extract it.
+4. Otherwise fall back to legacy folder download.
+5. Run restore-time backup conversion when platform mapping is needed.
+6. Run Ludusavi restore.
+7. Save the cloud manifest locally.
 
 ```mermaid
 flowchart TD
-    A[Start pull operation] --> B[Create temporary directory]
-    B --> C[Download snapshot with rclone]
-    C --> D[Run Ludusavi restore]
-    D --> E[Save cloud manifest in local cache]
-    E --> F[Return synced status]
+    A[Create temp staging directory] --> B[Fetch cloud SyncMeta]
+    B --> C{Compressed snapshot?}
+    C -->|Yes| D[Download save.tar.gz]
+    C -->|No| E[Download legacy backup tree]
+    D --> F[Validate archive member paths]
+    F --> G[Extract archive]
+    E --> H[Legacy staging ready]
+    G --> I[Convert backup for target platform]
+    H --> I
+    I --> J[Run ludusavi restore]
+    J --> K[Persist cloud manifest locally]
 ```
 
-### Exact Ludusavi command used for pull
+Exact Ludusavi command:
 
 ```text
 ludusavi restore --api --force --path <staging_game_dir> <game_name>
 ```
 
-## Which Files Get Replaced
+The tar extraction path is validated to reject absolute paths and `..` traversal before extraction.
 
-This is the key design point.
+## Restore-Time Path Conversion
 
-The current implementation does not resolve replacement at file granularity.
+This is active in the current pipeline. `SyncEngine.pull()` calls `convert_simple_backup_for_restore()` before running Ludusavi restore.
 
-What actually happens:
+The converter:
 
-- `push()` uploads a full staged snapshot for a game
-- `pull()` restores a full staged snapshot for a game, rewriting Windows and Wine-prefix absolute paths first when the host environments differ
+- locates the Ludusavi backup root and `mapping.yaml`
+- rewrites stored file paths in the backup tree
+- rewrites file-path keys inside `mapping.yaml`
+- rebuilds drive-folder metadata when needed
+- removes empty directories left behind after path moves
 
-Cross-platform path rewriting now applies to any Linux save path that Ludusavi reports inside a Wine-style `.../drive_c` prefix. That includes Steam compatdata prefixes and non-Steam launchers such as Heroic or Lutris when their saves live inside a Wine prefix.
-- conflict resolution chooses one of those two operations
+Conversion rules currently supported:
 
-What does not happen:
+- Windows to Wine or Proton prefixes
+- Wine or Proton prefixes back to Windows
 
-- no per-file "newest file wins" rule
-- no merge of local and cloud file sets
-- no selective restore of a subset of files based on timestamps or hashes
-
-So the replacement unit is the whole game snapshot.
-
-## How “Newer” Is Determined
-
-Implemented in `core/manifest.py::compare()` and used by `SyncEngine.check_status()`.
-
-Decision rules:
-
-1. If hashes are equal, return `SYNCED`.
-2. If hashes differ and `local.timestamp > cloud.timestamp`, return `LOCAL_NEWER`.
-3. If hashes differ and `cloud.timestamp > local.timestamp`, return `CLOUD_NEWER`.
-4. If hashes differ and timestamps are equal, return `CONFLICT`.
-
-Flow:
-
-```mermaid
-flowchart TD
-    A[Compare local and cloud manifests] --> B{Hashes equal}
-    B -->|Yes| C[Synced]
-    B -->|No| D{Local timestamp newer}
-    D -->|Yes| E[Local newer]
-    D -->|No| F{Cloud timestamp newer}
-    F -->|Yes| G[Cloud newer]
-    F -->|No| H[Conflict]
-```
-
-### Important nuance
-
-“Newer” is manifest-level, not file-level.
-
-The engine does not compare individual `SaveFile.modified` values to decide the winner. Those per-file timestamps are stored for metadata and display, but the winner is chosen by the top-level manifest timestamp.
-
-## How `check_status()` Works
-
-`SyncEngine.check_status(game_id)` performs a two-source comparison:
-
-- local cached manifest: loaded from the per-game state file
-- cloud manifest: downloaded from `<prefix>/<game_id>/manifest.json`
-
-Rules before manifest comparison:
-
-- both missing -> `UNKNOWN`
-- cloud missing, local exists -> `LOCAL_NEWER`
-- local missing, cloud exists -> `CLOUD_NEWER`
-
-Only when both exist does the engine call `manifest.compare(local, cloud)`.
-
-## How `sync()` Decides What To Do
-
-`SyncEngine.sync(game_id)` is a thin coordinator over `check_status()`.
-
-Rules:
-
-- `SYNCED` -> no-op
-- `CONFLICT` -> return conflict; caller must resolve in UI
-- `LOCAL_NEWER` -> call `push(game_id)`
-- `UNKNOWN` -> also call `push(game_id)`
-- `CLOUD_NEWER` -> fetch cloud manifest and call `pull(game_id, manifest)`
-
-Flow:
-
-```mermaid
-flowchart TD
-    A[Start sync operation] --> B[Check status]
-    B --> C{status}
-    C -->|SYNCED| D[Return synced]
-    C -->|CONFLICT| E[Return conflict]
-    C -->|LOCAL_NEWER| F[Run push]
-    C -->|UNKNOWN| F
-    C -->|CLOUD_NEWER| G[Load cloud manifest]
-    G --> H{Manifest found}
-    H -->|No| I[Return unknown error]
-    H -->|Yes| J[Run pull]
-```
-
-### Why `UNKNOWN` currently pushes
-
-This is a product decision embedded in the current implementation: when the app has no local or cloud metadata to compare, it treats the current machine as the source of truth and creates the first cloud snapshot by pushing.
-
-That behavior is simple, but it is important to document because it means first sync is biased toward upload.
+This covers Steam compatdata prefixes and non-Steam titles as long as Ludusavi reports saves inside a Wine-style `drive_c` prefix.
 
 ## Conflict Resolution Logic
 
-The engine itself does not resolve conflicts. It reports `SyncStatus.CONFLICT`.
+The engine reports `SyncStatus.CONFLICT`; the UI owns the resolution step.
 
-The UI then opens `ConflictDialog` and maps the choice to one of two full operations:
+Current mapping in `MainWindow`:
 
-- `KEEP_LOCAL` -> invoke `_on_push_game()`
-- `KEEP_CLOUD` -> invoke `_on_pull_game()`
-- `KEEP_NEITHER` -> do nothing
+- `KEEP_LOCAL` triggers `_force_push_game()`
+- `KEEP_CLOUD` triggers `_force_pull_game()`
+- `KEEP_NEITHER` leaves state unchanged
 
-This means conflict resolution is still snapshot-level. The dialog helps the user choose a side, but it does not perform a merge.
+```mermaid
+flowchart TD
+    A[SyncWorker emits conflict] --> B[MainWindow opens ConflictDialog]
+    B --> C{Choice}
+    C -->|Keep Mine| D[Start PushWorker]
+    C -->|Keep Cloud| E[Start FetchCloudManifestWorker]
+    E --> F[Start PullWorker]
+    C -->|Cancel| G[Return without changes]
+```
+
+Conflict resolution remains snapshot-level. No merge step exists.
 
 ## Manifest Hash Construction
 
-Implemented in `_build_manifest()`.
+`_build_manifest()`:
 
-Algorithm:
-
-1. Recursively walk every file under the staged game directory.
-2. Sort paths deterministically using `sorted(game_dir.rglob("*"))`.
-3. For each file:
-4. Read the full file bytes.
-5. Feed bytes into a single SHA-256 hasher.
-6. Record file metadata relative to the staged game directory.
+1. walks every staged file in sorted order
+2. reads file bytes
+3. updates one SHA-256 digest with file contents
+4. records relative path, size, and modified time
 
 Consequences:
 
-- identical staged content produces the same manifest hash
-- the hash is based on file content, not on filenames alone
-- the algorithm reads all staged files fully into memory one by one
-
-The code does not currently include file paths in the digest input. In practice, staged backups are still deterministic enough for current use, but this is worth noting if stronger manifest semantics are needed later.
+- identical staged content produces identical hashes
+- hashes are content-based
+- file paths are not currently included in the digest input
 
 ## Local Persistence
 
@@ -265,9 +285,9 @@ The code does not currently include file paths in the digest input. In practice,
 Stored as TOML:
 
 - Windows: `%APPDATA%/savesync-bridge/config.toml`
-- Linux / Steam Deck: `$XDG_CONFIG_HOME/savesync-bridge/config.toml` or `~/.config/savesync-bridge/config.toml`
+- Linux or Steam Deck: `~/.config/savesync-bridge/config.toml`
 
-Fields:
+Current fields:
 
 - `drive_remote`
 - `drive_root`
@@ -277,17 +297,18 @@ Fields:
 - `ludusavi_path`
 - `rclone_path`
 - `known_games`
+- `excluded_games`
 
-The app also maintains an rclone config file beside `config.toml` to persist the Google Drive OAuth token.
+An app-owned `rclone.conf` file is stored beside `config.toml` and contains the saved Google Drive remote and OAuth token.
 
 ### Local state cache
 
 Stored as per-game JSON manifests:
 
 - Windows: `%LOCALAPPDATA%/savesync-bridge/states/<game_id>.json`
-- Linux / Steam Deck: `$XDG_DATA_HOME/savesync-bridge/states/<game_id>.json` or `~/.local/share/savesync-bridge/states/<game_id>.json`
+- Linux or Steam Deck: `~/.local/share/savesync-bridge/states/<game_id>.json`
 
-These files are not saves. They are comparison metadata.
+These are metadata snapshots, not the actual save files.
 
 ## Cloud Persistence
 
@@ -297,90 +318,72 @@ Remote layout for each game:
 <backup_path>/<game_id>/
 ```
 
-Contents:
+Current contents usually include:
 
-- Ludusavi-produced backup files
+- `save.tar.gz`
+- `sync_meta.json`
 - `manifest.json`
 
-`manifest.json` is the cloud-side source used by `get_cloud_manifest()` and `check_status()`.
+Legacy snapshots may instead contain the uncompressed Ludusavi backup tree plus `manifest.json`.
 
 ## CLI Adapter Behavior
 
 ### Ludusavi adapter
 
-Implemented in `cli/ludusavi.py`.
-
 - `list_games()` -> `backup --preview --api`
 - `backup_game()` -> `backup --api --force --path ...`
 - `restore_game()` -> `restore --api --force --path ...`
 
-`list_games()` uses preview mode because `manifest show --api` is too broad for this app and can hang while processing the entire global manifest.
+`list_games()` uses preview mode to enumerate games currently visible on the machine rather than processing Ludusavi's full manifest database.
 
 ### rclone adapter
 
-Implemented in `cli/rclone.py`.
+- `upload()` uses `copy` into the configured remote path
+- `download()` uses `copy` from the configured remote path
+- `read_file()` uses `cat`
+- `list_files()` uses `lsjson`
+- Google Drive auth helpers maintain the app-owned `rclone.conf`
 
-- `upload()` -> `rclone --config <app-rclone.conf> copy <local> <remote>:<drive-root>/<path>`
-- `download()` -> `rclone --config <app-rclone.conf> copy <remote>:<drive-root>/<path> <local>`
-- `read_file()` -> `rclone --config <app-rclone.conf> cat <remote>:<drive-root>/<key>`
-- `list_files()` -> `rclone --config <app-rclone.conf> lsjson <remote>:<drive-root>/<path>`
-- `configure_google_drive_remote()` -> creates or updates a `drive` remote and saves the OAuth token into the app-owned `rclone.conf`
-- `reconnect_google_drive_remote()` -> refreshes the token with rclone's browser-based OAuth flow
-- `delete_remote_config()` -> removes the stored remote and token from the app-owned rclone config
-
-The wrapper can merge extra environment variables into the subprocess environment so credentials loaded from `.env` are inherited by rclone.
+The wrapper tracks active child processes and performs cleanup on exit.
 
 ## Debug Bus And Console
 
-All CLI wrappers emit best-effort events to `cli_bus`:
+CLI wrappers emit best-effort events to `cli_bus`:
 
 - command string
 - stdout
 - stderr
 - exit code
 
-`DebugPanel` subscribes to those events and renders a collapsible execution log in the main window. This is diagnostic only; it does not affect sync decisions.
-
-## Path Translation Module
-
-`core/path_translator.py` contains translation helpers for Windows environment-variable paths and Proton compatdata paths.
-
-Current status:
-
-- available as utility code
-- not part of the active push/pull decision pipeline in `SyncEngine`
-
-That distinction matters. The current synchronization logic depends on Ludusavi backup/restore behavior, not on direct path rewriting inside the engine.
+`DebugPanel` renders those events in the main window. This is diagnostic only and does not influence sync decisions.
 
 ## Current Constraints And Risks
 
-## 1. No true three-way merge
+### 1. No true three-way merge
 
-The code comments mention that full three-way conflict detection would require a stored base hash. That does not exist yet.
+There is no stored base snapshot hash, so conflict handling is still two-sided and timestamp-based.
 
-Current behavior is simpler:
+### 2. Snapshot-level replacement only
 
-- same hash -> synced
-- differing hashes + newer timestamp -> choose newer side
-- differing hashes + equal timestamp -> conflict
+The unit of replacement is the whole game backup, not individual files.
 
-## 2. Snapshot-level replacement only
+### 3. Timestamp semantics are app-generated
 
-This is the biggest product constraint. The app replaces one whole snapshot with another.
+Manifest timestamps are generated by SaveSync-Bridge when it writes metadata, not by the cloud provider.
 
-## 3. Timestamp semantics are app-generated
+### 4. `UNKNOWN` prefers push
 
-Manifest timestamps are generated when SaveSync-Bridge writes a manifest, not copied from a cloud provider clock. That is correct for the current design, but it means decision quality depends on when manifests were last written.
+If the engine lacks enough metadata to compare, it currently uploads the local machine's snapshot.
 
-## 4. `UNKNOWN` prefers push
+### 5. Native Linux saves are not remapped to Windows unless they live in Wine-style prefixes
 
-First-sync or missing-metadata situations currently resolve toward upload.
+Cross-platform conversion focuses on Windows and Wine or Proton layouts, not arbitrary native Linux save locations.
 
 ## Packaging Notes
 
-The project includes PyInstaller packaging support:
+The project uses PyInstaller:
 
 - spec file: `savesync_bridge.spec`
 - build command: `uv run build-exe`
 
-The packaged binary includes bundled `ludusavi` and `rclone` executables. `core/binaries.py` detects frozen execution via `sys._MEIPASS` so the app can still locate those tools from inside the packaged bundle.
+`core/binaries.py` prefers bundled binaries under `src/savesync_bridge/bin/<platform>/` in development and under `sys._MEIPASS/bin/<platform>/` in frozen builds, falling back to `PATH` when needed.

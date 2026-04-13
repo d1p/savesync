@@ -85,6 +85,14 @@ class TestGetCloudManifest:
         assert GAME_ID in key
         assert "manifest.json" in key
 
+    def test_reads_manifest_without_cli_probe_logging(self, engine: SyncEngine) -> None:
+        m = _make_manifest()
+        json_bytes = manifest_module.to_json(m).encode("utf-8")
+        with patch("savesync_bridge.core.sync_engine.rclone") as mock_rclone:
+            mock_rclone.read_file.return_value = json_bytes
+            engine.get_cloud_manifest(GAME_ID)
+        assert mock_rclone.read_file.call_args.kwargs["report_cli"] is False
+
     def test_returns_none_when_rclone_error(self, engine: SyncEngine) -> None:
         with patch("savesync_bridge.core.sync_engine.rclone") as mock_rclone:
             mock_rclone.read_file.side_effect = RcloneError("not found", 1, "")
@@ -362,6 +370,21 @@ class TestCheckStatus:
             result = engine.check_status(GAME_ID)
         assert result.status == SyncStatus.SYNCED
         mock_full.assert_not_called()  # should NOT fall back to full manifest
+
+    def test_sync_meta_probe_is_silent(self, engine: SyncEngine) -> None:
+        cloud_meta = SyncMeta(
+            game_id=GAME_ID,
+            hash="sha256:same",
+            timestamp=datetime(2026, 4, 12, 10, 0, 0, tzinfo=UTC),
+            compressed=True,
+            archive_name="save.tar.gz",
+            total_size=1024,
+        )
+        with patch("savesync_bridge.core.sync_engine.rclone") as mock_rclone:
+            mock_rclone.read_file.return_value = manifest_module.sync_meta_to_json(cloud_meta).encode("utf-8")
+            result = engine._get_cloud_sync_meta(GAME_ID)
+        assert result == cloud_meta
+        assert mock_rclone.read_file.call_args.kwargs["report_cli"] is False
 
 
 # ---------------------------------------------------------------------------

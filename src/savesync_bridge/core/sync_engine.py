@@ -146,6 +146,7 @@ class SyncEngine:
                 env=self._env,
                 binary=self._rclone_bin,
                 config_file=self._rclone_config_file,
+                report_cli=False,
             )
             return manifest_module.from_json(raw.decode("utf-8"))
         except RcloneError:
@@ -162,6 +163,7 @@ class SyncEngine:
                 env=self._env,
                 binary=self._rclone_bin,
                 config_file=self._rclone_config_file,
+                report_cli=False,
             )
             return manifest_module.sync_meta_from_json(raw.decode("utf-8"))
         except (RcloneError, json.JSONDecodeError, KeyError, ValueError):
@@ -286,6 +288,7 @@ class SyncEngine:
                             env=self._env,
                             binary=self._rclone_bin,
                             config_file=self._rclone_config_file,
+                            report_cli=False,
                         )
                         archive_path = staging_path / sync_meta.archive_name
                         archive_path.write_bytes(archive_data)

@@ -47,13 +47,19 @@ if sys.platform != "win32":
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
 
-def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:  # type: ignore[type-arg]
+def _run(
+    cmd: list[str],
+    *,
+    report_cli: bool = True,
+    **kwargs,
+) -> subprocess.CompletedProcess:  # type: ignore[type-arg]
     """Wrapper around subprocess.run that tracks children and emits on cli_bus."""
-    try:
-        from savesync_bridge.core.cli_bus import cli_bus
-        cli_bus.command_run.emit(" ".join(str(c) for c in cmd))
-    except Exception:
-        pass
+    if report_cli:
+        try:
+            from savesync_bridge.core.cli_bus import cli_bus
+            cli_bus.command_run.emit(" ".join(str(c) for c in cmd))
+        except Exception:
+            pass
 
     # Translate capture_output + strip check for Popen compatibility.
     popen_kwargs = dict(kwargs)
@@ -78,19 +84,20 @@ def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:  # type: igno
 
     result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
-    try:
-        from savesync_bridge.core.cli_bus import cli_bus
-        if result.stdout:
-            text = result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else result.stdout
-            if text.strip():
-                cli_bus.stdout_line.emit(text.strip())
-        if result.stderr:
-            text = result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else result.stderr
-            if text.strip():
-                cli_bus.stderr_line.emit(text.strip())
-        cli_bus.exit_code.emit(result.returncode)
-    except Exception:
-        pass
+    if report_cli:
+        try:
+            from savesync_bridge.core.cli_bus import cli_bus
+            if result.stdout:
+                text = result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else result.stdout
+                if text.strip():
+                    cli_bus.stdout_line.emit(text.strip())
+            if result.stderr:
+                text = result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else result.stderr
+                if text.strip():
+                    cli_bus.stderr_line.emit(text.strip())
+            cli_bus.exit_code.emit(result.returncode)
+        except Exception:
+            pass
     return result
 
 
@@ -124,6 +131,7 @@ def _invoke(
     binary: Path | None = None,
     config_file: Path | None = None,
     text: bool = True,
+    report_cli: bool = True,
 ) -> subprocess.CompletedProcess:  # type: ignore[type-arg]
     if binary is None:
         binary = resolve_rclone()
@@ -134,6 +142,7 @@ def _invoke(
         text=text,
         check=False,
         env=_merged_env(env),
+        report_cli=report_cli,
     )
 
 
@@ -545,6 +554,7 @@ def read_file(
     env: dict[str, str] | None = None,
     binary: Path | None = None,
     config_file: Path | None = None,
+    report_cli: bool = True,
 ) -> bytes:
     """Run ``rclone cat <remote-target>`` and return raw stdout bytes.
 
@@ -555,6 +565,7 @@ def read_file(
         env: Extra environment variables merged into the subprocess env.
         binary: Path to the rclone binary. Defaults to ``resolve_rclone()``.
         config_file: Optional rclone config file path containing saved auth.
+        report_cli: Whether to emit this probe to the debug CLI event bus.
 
     Returns:
         Raw bytes of the remote file's contents.
@@ -569,6 +580,7 @@ def read_file(
         binary=binary,
         config_file=config_file,
         text=False,
+        report_cli=report_cli,
     )
 
     if result.returncode != 0:

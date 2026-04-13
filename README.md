@@ -1,98 +1,150 @@
 # SaveSync-Bridge
 
-A PySide6 GUI that acts as a smart manager for [Ludusavi](https://github.com/mtkennerly/ludusavi), enabling seamless game save synchronization between Windows PCs and Steam Deck via Google Drive.
+SaveSync-Bridge is a PySide6 desktop app for syncing Ludusavi-managed game saves between a Windows PC and Linux or Steam Deck through Google Drive.
+
+The current app is built around a single smart sync action per game. It scans games locally with Ludusavi, compares local state against cloud metadata, then either uploads, downloads, or asks you to resolve a conflict.
+
+![SaveSync-Bridge Sync Center](docs/%7B7281175E-B10C-44CB-9395-3E567351CEEE%7D.png)
+
+## What The App Does
+
+- Discovers locally available games with `ludusavi backup --preview --api`
+- Stores one local manifest per game so future sync decisions are fast
+- Uploads compressed save snapshots to Google Drive with rclone
+- Downloads and restores those snapshots through Ludusavi
+- Rewrites backup paths when moving saves between Windows and Wine or Proton prefixes
+- Lets you exclude individual games from `Sync All`
+
+## Sync Model
+
+SaveSync-Bridge syncs at the game snapshot level, not file-by-file.
+
+For each game, the app compares:
+
+- the local cached manifest from the last successful sync on this machine
+- the cloud `sync_meta.json` when available, or `manifest.json` as a fallback
+
+The result drives a single smart sync button.
+
+```mermaid
+flowchart TD
+	A[Click Sync] --> B[Load local manifest cache]
+	B --> C[Fetch cloud sync_meta.json]
+	C --> D{Cloud metadata found?}
+	D -->|Yes| E[Compare local hash and timestamp with cloud metadata]
+	D -->|No| F[Fetch cloud manifest.json]
+	F --> G[Compare local and cloud manifests]
+	E --> H{Status}
+	G --> H
+	H -->|Synced| I[Do nothing]
+	H -->|Local newer| J[Run push]
+	H -->|Cloud newer| K[Run pull]
+	H -->|Conflict| L[Show conflict dialog]
+	H -->|Unknown| M[Default to first push]
+	L --> N{User choice}
+	N -->|Keep Mine| J
+	N -->|Keep Cloud| K
+	N -->|Cancel| O[Leave unchanged]
+```
+
+### What Push Does
+
+```mermaid
+flowchart TD
+	A[Run Ludusavi backup for one game] --> B[Build GameManifest from staged files]
+	B --> C[Compress backup into save.tar.gz]
+	C --> D[Write manifest.json]
+	D --> E[Write sync_meta.json]
+	E --> F[Upload archive and metadata to Google Drive]
+	F --> G[Save manifest in local state cache]
+```
+
+### What Pull Does
+
+```mermaid
+flowchart TD
+	A[Download cloud snapshot] --> B{Compressed archive available?}
+	B -->|Yes| C[Extract save.tar.gz]
+	B -->|No| D[Download legacy uncompressed backup]
+	C --> E[Rewrite backup paths if platform changed]
+	D --> E
+	E --> F[Run Ludusavi restore]
+	F --> G[Save cloud manifest in local state cache]
+```
+
+## Current UI
+
+The main window is now a Sync Center:
+
+- `Refresh` rescans games visible to Ludusavi on the current machine
+- `Sync All` smart-syncs every non-excluded game
+- each game card has one `Sync` button and one exclusion checkbox
+- the left sidebar filters by `All Games`, `Local Newer`, `Conflicts`, `Synced`, and `Excluded`
+- the backup summary panel shows the active Google Drive remote, backup library, and token path
+- the debug console shows the exact Ludusavi and rclone commands being executed
 
 ## Documentation
 
 - User guide: [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 - Technical documentation: [docs/TECHNICAL.md](docs/TECHNICAL.md)
 
-## Cloud Builds And Releases
-
-This repository includes GitHub Actions workflows for prepackaged Windows and Linux builds.
-
-- `Cloud Build`: builds Windows and Linux artifacts in GitHub Actions and uploads them as workflow artifacts
-- `Release`: runs automatically on version tags like `v0.1.0` and publishes downloadable release archives for both platforms
-
-Each release archive contains:
-
-- the packaged SaveSync-Bridge app binary
-- bundled Ludusavi binary for that platform
-- bundled rclone binary for that platform
-- `.env.example`
-- `LICENSE`
-- `THIRD_PARTY_LICENSES.md`
-
-To create a GitHub release with both platform builds:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-What happens automatically after the tag push:
-
-- GitHub Actions starts the `Release` workflow
-- the workflow builds Windows and Linux binaries in parallel
-- each build bundles the matching platform's Ludusavi and rclone binaries
-- the workflow packages the results into downloadable archives plus SHA-256 checksum files
-- GitHub publishes those archives on the tag's release page
-
-To run an on-demand cloud build without publishing a release, use the `Cloud Build` workflow from the Actions tab.
-
-## Features
-
-- **Path Translation**: Automatically maps save paths between Windows and Wine/Proton prefixes, including non-Steam launchers that Ludusavi detects under `drive_c`
-- **Conflict Resolution**: Metadata-driven sync with a visual conflict resolution dialog
-- **Sync Center**: Unified view of all games regardless of which machine they were last played on
-- **Ludusavi Integration**: Uses Ludusavi's `--api` mode for save discovery and backup/restore
-- **Google Drive Auth UI**: Authenticates through the app, stores a reusable Drive token, and supports reconnecting when needed
-- **rclone Transport**: Leverages rclone CLI for Google Drive storage operations
-
 ## Requirements
 
 - Python 3.13+
-- [Ludusavi](https://github.com/mtkennerly/ludusavi) CLI installed and on PATH
-- [rclone](https://rclone.org/) CLI installed and on PATH, or use the bundled binary
+- `uv`
+- Ludusavi and rclone binaries, either bundled under `src/savesync_bridge/bin/` or available on `PATH`
+
+If the bundled binaries are missing in a development checkout, fetch them with:
+
+```bash
+uv run python scripts/fetch_bins.py --platform windows
+```
+
+Use `--platform linux` when preparing a Linux build.
 
 ## Setup
 
-On first launch, open `Backups`, authenticate Google Drive, and choose the Drive folder plus backup library path you want SaveSync-Bridge to use.
+On first launch, open `Backups`, authenticate Google Drive, then choose the Drive folder and backup library path to use.
 
 ```bash
-# Install Python 3.13 via pyenv
-pyenv install 3.13
-pyenv local 3.13
-
-# Install dependencies with uv
 uv sync
-
-# Run the app
 uv run savesync-bridge
 ```
 
-The saved Drive token is stored in `%APPDATA%/savesync-bridge/rclone.conf` on Windows and `~/.config/savesync-bridge/rclone.conf` on Linux / Steam Deck.
+Configuration is stored in:
+
+- Windows: `%APPDATA%/savesync-bridge/config.toml`
+- Linux or Steam Deck: `~/.config/savesync-bridge/config.toml`
+
+The saved Google Drive token is stored beside it in `rclone.conf`.
 
 ## Development
 
 ```bash
-# Install dev dependencies
 uv sync
-
-# Run tests
 uv run pytest
-
-# Lint & format
 uv run ruff check src/ tests/
 uv run ruff format src/ tests/
-
-# Build a standalone executable
 uv run build-exe
-
-# Package the built executable into a release archive
-uv run package-release --version v0.1.0
+uv run package-release --version v0.3.1 --platform windows
 ```
+
+## Cloud Builds And Releases
+
+The repository includes two GitHub Actions workflows:
+
+- `Cloud Build` builds Windows and Linux artifacts on pushes to `main` and on manual dispatch
+- `Release` builds Windows and Linux release bundles for tags like `v0.3.1` and publishes them on GitHub Releases
+
+To publish a tagged release:
+
+```bash
+git tag v0.3.1
+git push origin v0.3.1
+```
+
+Each packaged release includes the built app, bundled Ludusavi and rclone binaries for that platform, and license files.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

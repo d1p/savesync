@@ -158,6 +158,26 @@ class TestReadFile:
         assert args[1:3] == ["--config", str(CONFIG_FILE)]
         assert f"{REMOTE}:{ROOT}/saves/Hades/manifest.json" in args
 
+    def test_can_skip_cli_bus_reporting(self) -> None:
+        proc = _make_proc(stdout=b"data")
+        fake_cli_bus = MagicMock()
+        with (
+            _mock_popen(proc),
+            patch("savesync_bridge.core.cli_bus.cli_bus", fake_cli_bus),
+        ):
+            result = rclone_read_file(
+                REMOTE,
+                ROOT,
+                "saves/Hades/manifest.json",
+                binary=FAKE_BINARY,
+                report_cli=False,
+            )
+        assert result == b"data"
+        fake_cli_bus.command_run.emit.assert_not_called()
+        fake_cli_bus.stdout_line.emit.assert_not_called()
+        fake_cli_bus.stderr_line.emit.assert_not_called()
+        fake_cli_bus.exit_code.emit.assert_not_called()
+
 
 class TestListFiles:
     def test_returns_parsed_json_list(self) -> None:
