@@ -155,6 +155,25 @@ def test_compare_returns_sync_status_instance() -> None:
     assert isinstance(result, SyncStatus)
 
 
+def test_compare_synced_when_hashes_differ_but_all_files_identical_content() -> None:
+    """If manifest hashes differ but all files have identical content (only metadata differs), treat as synced."""
+    local = _manifest(
+        timestamp=_T2,
+        hash_="sha256:local",
+        files=(
+            SaveFile(path="save.dat", size=100, modified=_T2, file_hash="sha256:abc123"),
+        ),
+    )
+    cloud = _manifest(
+        timestamp=_T1,
+        hash_="sha256:cloud",
+        files=(
+            SaveFile(path="save.dat", size=100, modified=_T1, file_hash="sha256:abc123"),
+        ),
+    )
+    assert compare(local, cloud) == SyncStatus.SYNCED
+
+
 def test_oldest_known_created_prefers_created_timestamp() -> None:
     manifest = _manifest(
         files=(

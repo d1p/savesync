@@ -39,6 +39,8 @@ The score is built from:
 - how similar the file counts and total sizes are between both sides
 - whether a full scan of ALL files in the save directory confirms the recommendation
 
+**Note**: If all files have identical content despite different timestamps, the app treats this as synced and skips the conflict dialog entirely.
+
 The confidence label appears on each game card:
 
 - **High** (green, ≥ 85%): the app is confident and will auto-resolve conflicts without asking
@@ -244,6 +246,7 @@ This is the key behavior:
 - a push replaces the cloud snapshot for that game
 - a pull replaces the local snapshot for that game through Ludusavi restore
 - the replacement unit is the whole staged backup for one game
+- **metadata-only changes** (timestamps differ but file content is identical) are automatically resolved without prompting
 
 ## Excluding Games
 

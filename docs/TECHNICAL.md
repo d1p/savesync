@@ -340,14 +340,16 @@ Conflict resolution remains snapshot-level. No merge step exists.
 
 1. walks every staged file in sorted order
 2. reads file bytes
-3. updates one SHA-256 digest with file contents
-4. records relative path, size, and modified time
+3. updates one SHA-256 digest with file contents (manifest-level hash)
+4. computes per-file SHA-256 hash for each file
+5. records relative path, size, modified time, created time, and per-file hash
 
 Consequences:
 
-- identical staged content produces identical hashes
-- hashes are content-based
-- file paths are not currently included in the digest input
+- identical staged content produces identical manifest hashes
+- manifest hashes are content-based
+- per-file hashes enable detecting metadata-only changes (timestamps differ but content identical)
+- file paths are not included in the digest input
 
 ## Local Persistence
 

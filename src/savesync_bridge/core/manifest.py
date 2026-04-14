@@ -96,9 +96,20 @@ def compare(local: GameManifest, cloud: GameManifest) -> SyncStatus:
         start or launcher touch can produce a newer file with less progress.
         Until the engine stores an explicit common base for three-way merge
         semantics, differing hashes are treated conservatively as conflicts.
+        However, if per-file content hashes are available and all files have
+        identical content (only metadata differs), treat as synced.
     """
     if local.hash == cloud.hash:
         return SyncStatus.SYNCED
+
+    # If hashes differ but all files have identical content, treat as synced
+    diff = diff_manifests(local, cloud)
+    if (diff.total_files > 0 and diff.unchanged_count == diff.total_files and
+        all(f.file_hash is not None for f in local.files) and
+        all(f.file_hash is not None for f in cloud.files)):
+        # All files have matching content (verified by hash) — only metadata differs
+        return SyncStatus.SYNCED
+
     return SyncStatus.CONFLICT
 
 
