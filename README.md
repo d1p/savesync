@@ -1,19 +1,28 @@
-# SaveSync-Bridge
-
-SaveSync-Bridge is a PySide6 desktop app for syncing Ludusavi-managed game saves between a Windows PC and Linux or Steam Deck through Google Drive.
-
-The current app is built around a single smart sync action per game. It scans games locally with Ludusavi, compares local state against cloud metadata, then either uploads, downloads, or asks you to resolve a conflict.
+SaveSync-Bridge: Universal Cloud Saves for Steam Deck & Windows
 
 ![SaveSync-Bridge Sync Center](docs/%7B49CA6DE1-B522-4C70-8110-273287DCC97A%7D.png)
 
-## What The App Does
 
-- Discovers locally available games with `ludusavi backup --preview --api`
-- Stores one local manifest per game so future sync decisions are fast
-- Uploads compressed save snapshots to Google Drive with rclone
-- Downloads and restores those snapshots through Ludusavi
-- Rewrites backup paths when moving saves between Windows and Wine or Proton prefixes
-- Lets you exclude individual games from `Sync All`
+SaveSync-Bridge is an open-source PySide6 desktop application designed to bridge the gap between Windows PCs and Linux gaming handhelds like the Steam Deck. By leveraging the power of Ludusavi and Google Drive, SaveSync-Bridge provides a seamless, automated way to sync game saves across different operating systems—even for games that don't support Steam Cloud.
+
+Whether you are switching from your desktop to your Steam Deck or moving between Windows and Wine/Proton prefixes, SaveSync-Bridge ensures your progress follows you.
+Key Features
+
+    Cross-Platform Sync: Effortlessly move saves between Windows and Linux/Steam Deck.
+
+    Google Drive Integration: Uses rclone to turn your personal Google Drive into a private save-game cloud.
+
+    Smart Conflict Resolution: Automatically detects which save is newer and prompts you to resolve version mismatches.
+
+    Automated Path Rewriting: Intelligent logic to handle different file path structures between Windows and Proton/Wine.
+
+    Powered by Ludusavi: Utilizes the industry-standard Ludusavi engine to discover and back up over 10,000+ games.
+
+    Fast & Efficient: Uses a local manifest cache to perform "Smart Syncs" in seconds.
+
+Why use SaveSync-Bridge?
+
+If you play non-Steam games (Epic Games, GOG, Emulators) or titles without native cloud support, keeping your saves synchronized is a manual chore. SaveSync-Bridge automates this entire workflow with a single click, providing a "Sync Center" for your entire library.
 
 ## Sync Model
 
