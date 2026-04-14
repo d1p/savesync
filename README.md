@@ -1,4 +1,4 @@
-SaveSync-Bridge: Universal Cloud Saves for Steam Deck & Windows
+## SaveSync-Bridge: Universal Cloud Saves for Steam Deck & Windows
 
 ![SaveSync-Bridge Sync Center](docs/%7B49CA6DE1-B522-4C70-8110-273287DCC97A%7D.png)
 
