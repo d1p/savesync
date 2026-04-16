@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from savesync_bridge.cli import ludusavi, rclone
 from savesync_bridge.core import manifest as manifest_module
 from savesync_bridge.core.backup_converter import convert_simple_backup_for_restore
-from savesync_bridge.core.config import AppConfig
+from savesync_bridge.core.config import AppConfig, default_machine_name
 from savesync_bridge.core.exceptions import LudusaviError, RcloneError, SyncError
 from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncMeta, SyncStatus
 
@@ -187,6 +187,9 @@ def scan_save_directories(save_paths: tuple[str, ...] | list[str]) -> SaveDirSta
     )
 
 
+_IGNORED_MANIFEST_FILES = {"mapping.yaml", "registry.yaml"}
+
+
 def _build_manifest(
     game_id: str,
     game_dir: Path,
@@ -200,13 +203,16 @@ def _build_manifest(
     for f in sorted(game_dir.rglob("*")):
         if not f.is_file():
             continue
+        rel_path = f.relative_to(game_dir)
+        if rel_path.name in _IGNORED_MANIFEST_FILES:
+            continue
+
         data = f.read_bytes()
         hasher.update(data)
         file_hash = f"sha256:{hashlib.sha256(data).hexdigest()}"
         stat_result = f.stat()
         modified = datetime.fromtimestamp(stat_result.st_mtime, tz=UTC)
         created = _file_created_at(stat_result)
-        rel_path = f.relative_to(game_dir)
         if source_file_times is not None:
             source_key = _source_key_for_staged_path(rel_path)
             source_time = source_file_times.get(source_key) if source_key is not None else None
@@ -248,6 +254,8 @@ class SyncEngine:
         state_dir: Path | None = None,
     ) -> None:
         self._config = config
+        if not self._config.machine_name:
+            self._config.machine_name = default_machine_name()
         self._env = env
         self._ludusavi_bin = ludusavi_bin
         self._rclone_bin = rclone_bin
@@ -264,7 +272,8 @@ class SyncEngine:
         return self._ludusavi_bin
 
     def _cloud_prefix(self, game_id: str) -> str:
-        return f"{self._config.backup_path}/{game_id}"
+        base = self._config.backup_path.strip("/")
+        return f"{base}/{game_id}" if base else game_id
 
     # ------------------------------------------------------------------
     # Cloud lock helpers
@@ -300,7 +309,7 @@ class SyncEngine:
             _log.warning("Stale lock found for %s (%ds old), overriding", game_id, int(age))
         except RcloneError:
             pass  # No lock exists — good
-        except (json.JSONDecodeError, ValueError, KeyError):
+        except (json.JSONDecodeError, ValueError, TypeError, KeyError):
             _log.warning("Corrupt lock file for %s, overriding", game_id)
 
         # Write our lock
@@ -801,7 +810,22 @@ class SyncEngine:
         cloud_meta = self._get_cloud_sync_meta(game_id)
         if cloud_meta is not None and local is not None:
             status = manifest_module.compare_meta(local, cloud_meta)
-            return SyncResult(game_id=game_id, status=status, local_manifest=local)
+            if status != SyncStatus.CONFLICT:
+                return SyncResult(game_id=game_id, status=status, local_manifest=local)
+
+            # Compatibility: an older cloud sync_meta hash may reflect ignored
+            # Ludusavi metadata like mapping.yaml. Fall back to the full manifest
+            # to compare the actual save payload.
+            cloud = self.get_cloud_manifest(game_id)
+            if cloud is None:
+                return SyncResult(game_id=game_id, status=status, local_manifest=local)
+            status = manifest_module.compare(local, cloud)
+            return SyncResult(
+                game_id=game_id,
+                status=status,
+                local_manifest=local,
+                cloud_manifest=cloud,
+            )
 
         # Slow path: fall back to full manifest
         cloud = self.get_cloud_manifest(game_id)

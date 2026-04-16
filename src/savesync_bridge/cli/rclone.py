@@ -628,10 +628,19 @@ def list_files(
     )
 
     if result.returncode != 0:
+        stderr = result.stderr
+        stderr_text = (
+            stderr.decode("utf-8", errors="replace")
+            if isinstance(stderr, bytes)
+            else (stderr or "")
+        )
+        lowered = stderr_text.lower()
+        if "directory not found" in lowered or "no such file or directory" in lowered:
+            return []
         raise RcloneError(
-            f"rclone lsjson failed: {result.stderr}",
+            f"rclone lsjson failed: {stderr_text}",
             result.returncode,
-            result.stderr,
+            stderr_text,
         )
 
     try:

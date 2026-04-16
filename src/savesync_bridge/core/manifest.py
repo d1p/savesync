@@ -10,6 +10,30 @@ from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncMe
 
 LineageRecommendation = Literal["local", "cloud"]
 
+_IGNORED_MANIFEST_FILES = {"mapping.yaml", "registry.yaml"}
+
+
+def _is_ignored_manifest_file(path: str) -> bool:
+    return Path(path).name in _IGNORED_MANIFEST_FILES
+
+
+def _filter_manifest_files(files: tuple[SaveFile, ...]) -> tuple[SaveFile, ...]:
+    return tuple(f for f in files if not _is_ignored_manifest_file(f.path))
+
+
+def _manifest_without_ignored_files(manifest: GameManifest) -> GameManifest:
+    filtered_files = _filter_manifest_files(manifest.files)
+    if len(filtered_files) == len(manifest.files):
+        return manifest
+    return GameManifest(
+        game_id=manifest.game_id,
+        host=manifest.host,
+        timestamp=manifest.timestamp,
+        hash=manifest.hash,
+        files=filtered_files,
+        machine_id=manifest.machine_id,
+    )
+
 
 def to_json(manifest: GameManifest) -> str:
     """Serialise a GameManifest to a JSON string.
@@ -99,15 +123,19 @@ def compare(local: GameManifest, cloud: GameManifest) -> SyncStatus:
         However, if per-file content hashes are available and all files have
         identical content (only metadata differs), treat as synced.
     """
+    local = _manifest_without_ignored_files(local)
+    cloud = _manifest_without_ignored_files(cloud)
+
     if local.hash == cloud.hash:
         return SyncStatus.SYNCED
 
-    # If hashes differ but all files have identical content, treat as synced
     diff = diff_manifests(local, cloud)
-    if (diff.total_files > 0 and diff.unchanged_count == diff.total_files and
-        all(f.file_hash is not None for f in local.files) and
-        all(f.file_hash is not None for f in cloud.files)):
-        # All files have matching content (verified by hash) — only metadata differs
+    if (
+        diff.total_files > 0
+        and diff.unchanged_count == diff.total_files
+        and all(f.file_hash is not None for f in local.files)
+        and all(f.file_hash is not None for f in cloud.files)
+    ):
         return SyncStatus.SYNCED
 
     return SyncStatus.CONFLICT
@@ -160,6 +188,7 @@ def oldest_known_created(manifest: GameManifest) -> datetime | None:
     Falls back to the earliest modification time when creation times are not
     available from the host filesystem.
     """
+    manifest = _manifest_without_ignored_files(manifest)
     created_values = [f.created for f in manifest.files if f.created is not None]
     if created_values:
         return min(created_values)
@@ -170,6 +199,7 @@ def oldest_known_created(manifest: GameManifest) -> datetime | None:
 
 def latest_modified(manifest: GameManifest) -> datetime | None:
     """Return the most recent file modification time in a manifest."""
+    manifest = _manifest_without_ignored_files(manifest)
     if not manifest.files:
         return None
     return max(f.modified for f in manifest.files)
@@ -180,6 +210,8 @@ def recommend_lineage(
     cloud_manifest: GameManifest,
 ) -> LineageRecommendation | None:
     """Recommend which side appears to be the older-established save lineage."""
+    local_manifest = _manifest_without_ignored_files(local_manifest)
+    cloud_manifest = _manifest_without_ignored_files(cloud_manifest)
     local_created = oldest_known_created(local_manifest)
     cloud_created = oldest_known_created(cloud_manifest)
     local_modified = latest_modified(local_manifest)
@@ -238,6 +270,9 @@ def diff_manifests(
     is identical even when metadata (size/timestamps) may differ.  Falls back
     to size comparison when hashes are absent.
     """
+    local_manifest = _manifest_without_ignored_files(local_manifest)
+    cloud_manifest = _manifest_without_ignored_files(cloud_manifest)
+
     local_by_path = {f.path: f for f in local_manifest.files}
     cloud_by_path = {f.path: f for f in cloud_manifest.files}
     all_paths = sorted(set(local_by_path) | set(cloud_by_path))
@@ -336,8 +371,12 @@ def compute_confidence(
     cloud_created = oldest_known_created(cloud_manifest)
     local_modified = latest_modified(local_manifest)
     cloud_modified = latest_modified(cloud_manifest)
+    diff = diff_manifests(local_manifest, cloud_manifest)
 
     # --- Signal 1: Creation date gap (weight 0.25) ---
+    local_manifest = _manifest_without_ignored_files(local_manifest)
+    cloud_manifest = _manifest_without_ignored_files(cloud_manifest)
+
     if local_created is not None and cloud_created is not None:
         gap = abs((local_created - cloud_created).total_seconds())
         if gap > 86400 * 7:  # >7 days apart → very clear
@@ -356,7 +395,16 @@ def compute_confidence(
         weights.append((0.25, 0.0))
         reasons.append("Missing creation date info — cannot compare origins")
 
-    # --- Signal 2: Modification recency agreement (weight 0.20) ---
+    # --- Signal 2: Unchanged save files despite manifest/hash differences (weight 0.20) ---
+    if diff.total_files > 0 and diff.unchanged_count == diff.total_files:
+        weights.append((0.20, 1.0))
+        reasons.append(
+            "All tracked save files are unchanged; remaining differences appear limited to metadata."
+        )
+    else:
+        weights.append((0.20, 0.0))
+
+    # --- Signal 3: Modification recency agreement (weight 0.20) ---
     if local_modified is not None and cloud_modified is not None and recommendation is not None:
         newer_is_recommended = (
             (recommendation == "local" and local_modified >= cloud_modified)
@@ -371,7 +419,7 @@ def compute_confidence(
     else:
         weights.append((0.20, 0.0))
 
-    # --- Signal 3: Per-file content match ratio (weight 0.15) ---
+    # --- Signal 4: Per-file content match ratio (weight 0.15) ---
     diff = diff_manifests(local_manifest, cloud_manifest)
     if diff.total_files > 0:
         unchanged_ratio = diff.unchanged_count / diff.total_files
@@ -457,10 +505,11 @@ def compute_confidence(
     else:
         score = 0.0
 
-    # If no recommendation at all, score is capped low
+    # If no recommendation at all, score is capped low unless all files are unchanged.
     if recommendation is None:
-        score = min(score, 0.3)
-        reasons.append("No clear lineage recommendation — manual review required")
+        if diff.total_files == 0 or diff.unchanged_count != diff.total_files:
+            score = min(score, 0.3)
+            reasons.append("No clear lineage recommendation — manual review required")
 
     score = round(min(max(score, 0.0), 1.0), 2)
     safe = score >= AUTO_SYNC_CONFIDENCE_THRESHOLD and recommendation is not None
