@@ -56,6 +56,8 @@ flowchart TD
 	N -->|Cancel| O[Leave unchanged]
 ```
 
+For multiple games (e.g., `Sync All`), the app uses an optimized batch process: download the entire cloud directory once, generate a full local backup, compare all manifests locally, then perform batched uploads and restores.
+
 ### What Push Does
 
 ```mermaid

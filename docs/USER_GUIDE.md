@@ -147,6 +147,16 @@ flowchart TD
     N -->|Cancel| O[Stop without changes]
 ```
 
+When syncing multiple games (e.g., via `Sync All`), the app uses an optimized batch process to reduce network calls and improve performance:
+
+1. Download the entire cloud backup directory at once
+2. Generate a full local backup for all games
+3. Compare manifests locally for each game
+4. Stage uploads and downloads in batches
+5. Perform batch uploads and restores
+
+Conflicts and unknowns are still handled per-game through the UI dialogs.
+
 ### Why `Unknown` shows a prompt
 
 If neither side has enough metadata to compare, SaveSync-Bridge shows a dialog asking whether to push the local save to the cloud or cancel. This prevents accidental overwrites on first sync.
@@ -318,6 +328,11 @@ These files are sync metadata, not the actual game saves.
 - **UNKNOWN prompt**: no longer auto-pushes, asks before creating first cloud snapshot
 - **Retry logic**: transient rclone errors are retried with exponential backoff
 - **Stale cache pruning**: games with missing save paths are detected and cleaned up
+
+## New In v0.6.1
+
+- **Automatic machine identity**: when `machine_name` is blank, the app now generates a stable default identifier from the host machine name or hardware id
+- **Improved manifest comparison**: Ludusavi metadata files like `mapping.yaml` and `registry.yaml` are ignored so metadata-only churn does not trigger false conflicts
 
 ## Build And Run
 

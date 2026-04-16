@@ -48,6 +48,41 @@ flowchart TD
     P -->|Cancel| Q[Stop]
 ```
 
+For single-game syncs, this flow applies. When syncing multiple games, the UI worker uses `SyncEngine.batch_sync_games()` for optimized batch processing.
+
+## Batch Sync Flow
+
+When `Sync All` or multiple games are selected, the app uses batch operations to minimize network I/O:
+
+```mermaid
+flowchart TD
+    A[Start batch sync for multiple games] --> B[Create temp directories]
+    B --> C[Download entire cloud backup dir with rclone]
+    C --> D[Generate full local backup with ludusavi backup --api]
+    D --> E[For each game: load manifests and compare]
+    E --> F{Status}
+    F -->|Synced| G[Skip]
+    F -->|Local newer| H[Stage for upload]
+    F -->|Cloud newer| I[Stage for restore]
+    F -->|Conflict| J[Emit conflict event]
+    F -->|Unknown| K[Emit unknown event]
+    J --> L[Wait for UI resolution]
+    K --> M[Wait for UI decision]
+    L --> N[After all games processed]
+    M --> N
+    N --> O[Batch upload staged games with rclone]
+    O --> P[Batch restore staged games with ludusavi restore --api]
+    P --> Q[Return results for each game]
+```
+
+Key optimizations:
+
+- Single bulk download of cloud data
+- Single bulk local backup generation
+- Local manifest comparisons without network calls
+- Batched uploads and restores
+- Verification of staged data before final operations
+
 ## UI Flow And Workers
 
 `MainWindow` coordinates user actions and launches background threads so the GUI stays responsive.
@@ -478,6 +513,8 @@ The per-file content match ratio is used as Signal 3 (15% weight) in `compute_co
 ## Machine Identity (v0.5.0)
 
 `GameManifest` and `SyncMeta` now carry a `machine_id` field. `AppConfig` stores a `machine_name` that is embedded in manifests during push.
+
+When `machine_name` is not configured, the app now generates a stable default machine identifier from the host name or hardware-derived ID.
 
 Machine identity is visible in:
 
