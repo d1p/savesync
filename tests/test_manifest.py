@@ -344,15 +344,31 @@ def test_confidence_low_when_no_creation_dates() -> None:
     assert result.safe_to_auto_sync is False
 
 
+def test_confidence_medium_when_files_are_unchanged_but_manifest_differs() -> None:
+    """If files match exactly but manifest metadata differs, confidence should reflect content stability."""
+    local = _manifest(
+        hash_="sha256:local",
+        files=(SaveFile(path="save.dat", size=100, modified=_T2),),
+    )
+    cloud = _manifest(
+        hash_="sha256:cloud",
+        files=(SaveFile(path="save.dat", size=100, modified=_T1),),
+    )
+    result = compute_confidence(local, cloud)
+    assert result.score > 0.3
+    assert any("metadata" in reason.lower() for reason in result.reasons)
+    assert result.safe_to_auto_sync is False
+
+
 def test_confidence_capped_when_no_recommendation() -> None:
-    """When recommend_lineage returns None, score is capped at 0.3."""
+    """When recommend_lineage returns None, score is capped at 0.3 unless all files are unchanged."""
     local = _manifest(
         hash_="sha256:local",
         files=(SaveFile(path="save.dat", size=512, modified=_T1, created=_T0),),
     )
     cloud = _manifest(
         hash_="sha256:cloud",
-        files=(SaveFile(path="save.dat", size=512, modified=_T0, created=_T0),),
+        files=(SaveFile(path="save.dat", size=1024, modified=_T0, created=_T0),),
     )
     result = compute_confidence(local, cloud)
     assert result.score <= 0.3

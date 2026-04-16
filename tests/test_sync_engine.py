@@ -132,14 +132,14 @@ class TestPush:
         assert call_args[0][0] == GAME_ID
 
     def test_calls_rclone_upload_three_times(self, engine: SyncEngine) -> None:
-        """Should upload archive, manifest.json, and sync_meta.json."""
+        """Should upload lock, archive, manifest.json, and sync_meta.json."""
         with (
             patch("savesync_bridge.core.sync_engine.ludusavi") as mock_lud,
             patch("savesync_bridge.core.sync_engine.rclone") as mock_rcl,
         ):
             mock_lud.backup_game.return_value = Path("/tmp/staging/Hades")
             engine.push(GAME_ID)
-        assert mock_rcl.upload.call_count == 3
+        assert mock_rcl.upload.call_count == 4
 
     def test_saves_local_manifest_after_push(self, engine: SyncEngine, tmp_path: Path) -> None:
         with (
@@ -407,11 +407,68 @@ class TestCheckStatus:
         )
         with (
             patch.object(engine, "_get_cloud_sync_meta", return_value=cloud_meta),
-            patch.object(engine, "get_cloud_manifest") as mock_full,
+            patch.object(engine, "get_cloud_manifest", return_value=None) as mock_full,
         ):
             result = engine.check_status(GAME_ID)
         assert result.status == SyncStatus.CONFLICT
-        mock_full.assert_not_called()
+        mock_full.assert_called_once()
+
+    def test_sync_meta_conflict_falls_back_to_full_manifest_when_ignored_files_differ(
+        self, engine: SyncEngine
+    ) -> None:
+        local = GameManifest(
+            game_id=GAME_ID,
+            host=Platform.WINDOWS,
+            timestamp=datetime(2026, 4, 12, 10, 0, 0, tzinfo=UTC),
+            hash="sha256:local",
+            files=(
+                SaveFile(
+                    path="Profile1.sav",
+                    size=1024,
+                    modified=datetime(2026, 4, 12, 9, 0, 0, tzinfo=UTC),
+                    file_hash="sha256:abc123",
+                ),
+            ),
+        )
+        self._write_local(engine, local)
+
+        cloud_meta = SyncMeta(
+            game_id=GAME_ID,
+            hash="sha256:old-mapping",
+            timestamp=datetime(2026, 4, 12, 10, 0, 0, tzinfo=UTC),
+            compressed=True,
+            archive_name="save.tar.gz",
+            total_size=1024,
+        )
+
+        cloud = GameManifest(
+            game_id=GAME_ID,
+            host=Platform.WINDOWS,
+            timestamp=datetime(2026, 4, 12, 9, 0, 0, tzinfo=UTC),
+            hash="sha256:cloud",
+            files=(
+                SaveFile(
+                    path="Profile1.sav",
+                    size=1024,
+                    modified=datetime(2026, 4, 12, 9, 0, 0, tzinfo=UTC),
+                    file_hash="sha256:abc123",
+                ),
+                SaveFile(
+                    path="mapping.yaml",
+                    size=128,
+                    modified=datetime(2026, 4, 12, 9, 0, 0, tzinfo=UTC),
+                    file_hash="sha256:ignored",
+                ),
+            ),
+        )
+
+        with (
+            patch.object(engine, "_get_cloud_sync_meta", return_value=cloud_meta),
+            patch.object(engine, "get_cloud_manifest", return_value=cloud) as mock_full,
+        ):
+            result = engine.check_status(GAME_ID)
+        assert result.status == SyncStatus.SYNCED
+        mock_full.assert_called_once()
 
     def test_uses_sync_meta_fast_path(self, engine: SyncEngine) -> None:
         """check_status should use sync_meta when available, skipping full manifest fetch."""
@@ -724,6 +781,34 @@ class TestExportImport:
 # ---------------------------------------------------------------------------
 
 
+class TestBuildManifest:
+    def test_build_manifest_ignores_mapping_yaml(self, tmp_path: Path) -> None:
+        game_dir1 = tmp_path / "Hades1"
+        game_dir1.mkdir()
+        (game_dir1 / "mapping.yaml").write_text("version: 1\n", encoding="utf-8")
+        save1 = game_dir1 / "drive-0" / "save.dat"
+        save1.parent.mkdir(parents=True)
+        save1.write_bytes(b"content")
+
+        game_dir2 = tmp_path / "Hades2"
+        game_dir2.mkdir()
+        mapping2 = game_dir2 / "nested" / "mapping.yaml"
+        mapping2.parent.mkdir(parents=True)
+        mapping2.write_text("version: 2\n", encoding="utf-8")
+        save2 = game_dir2 / "drive-0" / "save.dat"
+        save2.parent.mkdir(parents=True)
+        save2.write_bytes(b"content")
+
+        from savesync_bridge.core.sync_engine import _build_manifest
+
+        manifest1 = _build_manifest("Hades", game_dir1)
+        manifest2 = _build_manifest("Hades", game_dir2)
+
+        assert manifest1.hash == manifest2.hash
+        assert all(f.path != "mapping.yaml" for f in manifest1.files)
+        assert all("mapping.yaml" not in f.path for f in manifest2.files)
+
+
 class TestCloudLock:
     def test_acquire_lock_succeeds_when_no_lock(self, engine: SyncEngine) -> None:
         """Lock acquisition succeeds when no existing lock."""
@@ -755,6 +840,20 @@ class TestCloudLock:
         lock_data = json.dumps({
             "machine": "old-pc",
             "timestamp": old_ts,
+        }).encode("utf-8")
+        with (
+            patch("savesync_bridge.cli.rclone.read_file", return_value=lock_data),
+            patch("savesync_bridge.cli.rclone.upload") as mock_upload,
+        ):
+            engine._acquire_lock(GAME_ID)
+        mock_upload.assert_called_once()
+
+    def test_acquire_lock_overrides_corrupt_lock(self, engine: SyncEngine) -> None:
+        """Corrupt or malformed lock content is treated as stale and overridden."""
+        import json
+        lock_data = json.dumps({
+            "machine": "bad-pc",
+            "timestamp": None,
         }).encode("utf-8")
         with (
             patch("savesync_bridge.cli.rclone.read_file", return_value=lock_data),

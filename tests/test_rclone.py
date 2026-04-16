@@ -192,6 +192,12 @@ class TestListFiles:
         with _mock_popen(proc), pytest.raises(RcloneError):
             list_files(REMOTE, ROOT, BACKUP_PATH, binary=FAKE_BINARY)
 
+    def test_returns_empty_list_when_directory_missing(self) -> None:
+        proc = _make_proc(returncode=1, stderr=b"2026/04/16 22:58:46 ERROR : error listing: directory not found")
+        with _mock_popen(proc):
+            result = list_files(REMOTE, ROOT, BACKUP_PATH, binary=FAKE_BINARY)
+        assert result == []
+
 
 class TestFileExists:
     def test_returns_true_when_file_found(self) -> None:

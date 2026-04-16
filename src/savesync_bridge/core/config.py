@@ -1,13 +1,36 @@
 from __future__ import annotations
 
 import os
-import sys
+import platform
+import re
+import socket
 import tomllib
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_DRIVE_REMOTE = "gdrive"
 DEFAULT_BACKUP_PATH = "savesync-bridge"
+
+
+def default_machine_name() -> str:
+    """Generate a stable machine identifier when the user has not configured one."""
+    name = os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME")
+    if not name:
+        name = platform.node() or ""
+    if not name:
+        try:
+            name = socket.gethostname()
+        except Exception:
+            name = ""
+    name = str(name).strip()
+    if not name:
+        name = f"machine-{uuid.getnode():012x}" if uuid.getnode() else "machine"
+
+    name = name.lower().replace(" ", "-")
+    name = re.sub(r"[^a-z0-9_-]+", "-", name)
+    name = re.sub(r"-+", "-", name).strip("-")
+    return name or "machine"
 
 
 @dataclass
@@ -59,7 +82,7 @@ def load_config(config_dir: Path | None = None) -> AppConfig:
 
     cfg_file = _config_file(config_dir)
     if not cfg_file.exists():
-        return AppConfig()
+        return AppConfig(machine_name=default_machine_name())
 
     with cfg_file.open("rb") as fh:
         data = tomllib.load(fh)
@@ -74,7 +97,7 @@ def load_config(config_dir: Path | None = None) -> AppConfig:
         rclone_path=data.get("rclone_path"),
         known_games=list(data.get("known_games", [])),
         excluded_games=list(data.get("excluded_games", [])),
-        machine_name=data.get("machine_name", ""),
+        machine_name=str(data.get("machine_name") or default_machine_name()),
         max_versions=int(data.get("max_versions", 3)),
     )
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from savesync_bridge.core import config as config_module
 from savesync_bridge.core.config import (
     DEFAULT_BACKUP_PATH,
     DEFAULT_DRIVE_REMOTE,
@@ -38,6 +39,19 @@ def test_load_config_creates_default_when_missing(tmp_path: Path) -> None:
     assert isinstance(cfg, AppConfig)
     assert cfg.drive_remote == DEFAULT_DRIVE_REMOTE
     assert cfg.backup_path == DEFAULT_BACKUP_PATH
+    assert cfg.machine_name != ""
+
+
+def test_load_config_generates_machine_name_when_explicitly_empty(tmp_path: Path) -> None:
+    (tmp_path / "config.toml").write_text(
+        'drive_remote = "gdrive"\n'
+        'backup_path = "saves"\n'
+        'machine_name = ""\n',
+        encoding="utf-8",
+    )
+
+    cfg = load_config(config_dir=tmp_path)
+    assert cfg.machine_name != ""
 
 
 def test_load_config_does_not_raise_on_missing_dir(tmp_path: Path) -> None:
@@ -124,6 +138,15 @@ def test_save_and_load_special_chars_in_strings(tmp_path: Path) -> None:
     assert restored.drive_root == 'folder-"test"'
     assert restored.backup_path == "path\\with\\backslash"
     assert restored.drive_client_secret == 'secret-"quoted"'
+
+
+def test_default_machine_name_sanitizes_hostname(monkeypatch) -> None:
+    monkeypatch.delenv("COMPUTERNAME", raising=False)
+    monkeypatch.delenv("HOSTNAME", raising=False)
+    monkeypatch.setattr(config_module.platform, "node", lambda: "My Desktop!")
+    monkeypatch.setattr(config_module.socket, "gethostname", lambda: "unused")
+
+    assert config_module.default_machine_name() == "my-desktop"
 
 
 def test_rclone_config_path_defaults_under_config_dir(tmp_path: Path) -> None:
