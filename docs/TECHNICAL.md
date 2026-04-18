@@ -1,6 +1,6 @@
 # SaveSync-Bridge Technical Documentation
 
-This document describes the current implementation in the repository as of v0.5.0, with emphasis on the smart-sync pipeline, cloud storage format, background workers, confidence scoring, per-file diffing, backup versioning, and restore-time path conversion.
+This document describes the current implementation in the repository as of v0.6.0, with emphasis on the smart machine-ID sync optimization, smart-sync pipeline, cloud storage format, background workers, confidence scoring, per-file diffing, backup versioning, and restore-time path conversion.
 
 ## Architecture Overview
 
@@ -143,22 +143,47 @@ Current serialization writes `version: 2` into `sync_meta.json`.
 
 Comparison logic is implemented in `core/manifest.py`.
 
-Rules for both `compare()` and `compare_meta()`:
+### Smart Machine ID Optimization (v0.6.0+)
 
-1. Matching hashes return `SYNCED`.
-2. Any hash mismatch returns `CONFLICT`.
+Starting with v0.6.0, the comparison functions are **machine-aware**. When comparing local and cloud manifests, the engine checks if the local manifest originated from the current machine (`runner_machine_id` parameter).
+
+**Smart sync decision tree:**
 
 ```mermaid
 flowchart TD
     A[Compare hashes] --> B{Hashes equal?}
     B -->|Yes| C[Synced]
-    B -->|No| H[Conflict]
+    B -->|No| D{Same machine AND<br/>local newer?}
+    D -->|Yes| E[Local Newer<br/>Skip conflict dialog]
+    D -->|No| F{Same machine AND<br/>local older?}
+    F -->|Yes| G[Conflict<br/>Use confidence scoring]
+    F -->|No| H{Different machine?}
+    H -->|Yes| I[Conflict<br/>Use confidence scoring]
+    H -->|No| J[Conflict<br/>Use confidence scoring]
 ```
 
-Important nuance:
+**Behavior:**
+
+- **Same machine + local newer**: Returns `LOCAL_NEWER` immediately, **skipping conflict resolution entirely**. This is safe because:
+  - The local save was just created or modified on this machine
+  - It's provably newer than the cloud version
+  - No meaningful data loss risk when overwriting older cloud state
+  
+- **Same machine + local older**: Returns `CONFLICT`, still uses confidence scoring. Timestamps alone are not trusted for auto-resolution (fresh game start or launcher touch can produce newer files with less progress).
+
+- **Different machine or no machine ID**: Returns `CONFLICT`, uses full confidence scoring. Preserves existing cross-machine safety guarantees.
+
+### Traditional Comparison Rules
+
+For both `compare()` and `compare_meta()` (when machine ID check doesn't apply):
+
+1. Matching hashes return `SYNCED`.
+2. Any hash mismatch returns `CONFLICT`.
+
+Important nuances:
 
 - comparison is snapshot-level, not file-level
-- timestamp ordering is no longer trusted to pick a winner when content differs
+- timestamp ordering alone is not trusted for silent auto-resolution across machines
 - `SaveFile.modified` and `SaveFile.created` are used for confidence scoring and user guidance, not for silent auto-resolution
 
 ## Confidence Scoring
@@ -201,7 +226,7 @@ This data feeds into the directory scan corroboration signal of the confidence s
 
 ## `check_status()` Behavior
 
-`SyncEngine.check_status(game_id)` prefers the lightweight metadata path, and `SyncEngine.sync()` now refreshes live local state before making a sync decision.
+`SyncEngine.check_status(game_id)` prefers the lightweight metadata path, and `SyncEngine.sync()` now refreshes live local state before making a sync decision. The machine ID from the current configuration is passed to comparison functions for smart sync optimization.
 
 Flow:
 
@@ -210,7 +235,7 @@ flowchart TD
     A[Sync only: probe live local save via Ludusavi preview plus temp backup] --> B[Fallback to cached local manifest only if live probe fails]
     B --> C[Fetch cloud sync_meta.json]
     C --> D{Local and cloud SyncMeta available?}
-    D -->|Yes| E[compare_meta local vs cloud]
+    D -->|Yes| E["compare_meta with runner_machine_id<br/>(may skip conflict if same machine &amp; newer)"]
     D -->|No| F[Fetch full cloud manifest]
     F --> G{Both manifests missing?}
     G -->|Yes| H[Unknown]
@@ -218,7 +243,7 @@ flowchart TD
     I -->|Yes| J[Local newer]
     I -->|No| K{Local missing?}
     K -->|Yes| L[Cloud newer]
-    K -->|No| M[compare local vs cloud]
+    K -->|No| M["compare with runner_machine_id<br/>(may skip conflict if same machine &amp; newer)"]
 ```
 
 The fast path is only used when both a local manifest and cloud `sync_meta.json` exist. Otherwise the engine falls back to the full-manifest path for compatibility with older snapshots.
@@ -228,6 +253,10 @@ Live local probing is intentionally conservative:
 - a temporary Ludusavi backup is created to compute a fresh content hash using the same staged layout as cloud snapshots
 - Ludusavi preview output supplies the original on-disk save paths
 - original file `created` and `modified` timestamps are captured from those real save files and injected into the manifest for conflict guidance
+
+**Machine ID Passing (v0.6.0+):**
+
+`SyncEngine.check_status()` and `SyncEngine.sync()` pass `self._config.machine_name` as the `runner_machine_id` parameter to `compare()` and `compare_meta()`, enabling the smart sync optimization described above.
 
 ## Push Pipeline
 
