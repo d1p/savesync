@@ -10,7 +10,15 @@ from savesync_bridge.core.exceptions import LudusaviError
 
 
 def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:  # type: ignore[type-arg]
-    """Wrapper around subprocess.run that emits on cli_bus (best-effort)."""
+    """Wrapper around subprocess.run that emits on cli_bus (best-effort).
+    
+    Ensures UTF-8 encoding on all platforms (especially important on Windows).
+    """
+    # Set UTF-8 encoding if text mode is requested
+    if kwargs.get('text') or kwargs.get('capture_output'):
+        kwargs.setdefault('encoding', 'utf-8')
+        kwargs.setdefault('errors', 'replace')
+    
     try:
         from savesync_bridge.core.cli_bus import cli_bus
         cli_bus.command_run.emit(" ".join(str(c) for c in cmd))

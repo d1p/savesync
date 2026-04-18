@@ -53,7 +53,10 @@ def _run(
     report_cli: bool = True,
     **kwargs,
 ) -> subprocess.CompletedProcess:  # type: ignore[type-arg]
-    """Wrapper around subprocess.run that tracks children and emits on cli_bus."""
+    """Wrapper around subprocess.run that tracks children and emits on cli_bus.
+    
+    Ensures UTF-8 encoding on all platforms (especially important on Windows).
+    """
     if report_cli:
         try:
             from savesync_bridge.core.cli_bus import cli_bus
@@ -67,6 +70,11 @@ def _run(
     if popen_kwargs.pop("capture_output", False):
         popen_kwargs.setdefault("stdout", subprocess.PIPE)
         popen_kwargs.setdefault("stderr", subprocess.PIPE)
+    
+    # Ensure UTF-8 encoding for text mode (critical on Windows)
+    if popen_kwargs.get('text'):
+        popen_kwargs.setdefault('encoding', 'utf-8')
+        popen_kwargs.setdefault('errors', 'replace')
 
     proc = subprocess.Popen(cmd, **popen_kwargs)
     _active_processes.append(proc)
@@ -175,6 +183,8 @@ def _invoke_auth(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding='utf-8',
+        errors='replace',
         env=merged,
     )
     _active_processes.append(proc)
