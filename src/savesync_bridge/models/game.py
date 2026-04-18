@@ -40,9 +40,19 @@ class GameManifest:
 
 @dataclass(frozen=True)
 class SyncMeta:
-    """Lightweight metadata for quick cloud status checks without downloading full manifest."""
+    """Lightweight metadata for quick cloud status checks without downloading full manifest.
+    
+    IMPORTANT: The `game_id` field contains the ORIGINAL, unmodified Ludusavi game identifier,
+    even if the game name contains special characters like colons. This is used to:
+    - Map back to the actual game when displaying UI
+    - Call ludusavi.restore_game() with the correct game identifier
+    - Track sync history per actual game
+    
+    Temporary filesystem paths may use sanitized versions of game_id (colons → underscores),
+    but this metadata always preserves the original.
+    """
 
-    game_id: str
+    game_id: str  # Original Ludusavi game identifier (e.g., "Mafia: Definitive Edition")
     hash: str
     timestamp: datetime
     compressed: bool = False

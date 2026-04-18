@@ -60,16 +60,11 @@ class SyncWorker(QThread):
         done = 0
         self.progress.emit(0, total)
         try:
-            for game_id in self._game_ids:
-                target_wine_prefix, target_wine_user = self._target_wine_contexts.get(
-                    game_id,
-                    (None, None),
-                )
-                result: SyncResult = self._engine.sync(
-                    game_id,
-                    target_wine_prefix=target_wine_prefix,
-                    target_wine_user=target_wine_user,
-                )
+            # Use batch sync for efficiency: single ludusavi call, single rclone meta fetch, etc.
+            plan = self._engine.batch_sync_all(self._game_ids, self._target_wine_contexts)
+
+            # Emit signals for each game result
+            for game_id, result in plan.results.items():
                 done += 1
                 if result.status == SyncStatus.CONFLICT:
                     local = result.local_manifest or self._engine.get_local_manifest(game_id)

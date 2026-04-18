@@ -71,6 +71,25 @@ def _normalize_path(path: str) -> str:
     return path.replace("\\", "/")
 
 
+def _get_long_path(path: Path | str) -> Path:
+    """Convert a path to its long form on Windows, avoiding 8.3 short names.
+    
+    On Windows, tempfile and other APIs may return paths using 8.3 short names
+    (like C:\\Users\\DEBASH~1\\...). This function converts them to long names.
+    On other platforms, returns the path unchanged.
+    """
+    if sys.platform != "win32":
+        return Path(path) if isinstance(path, str) else path
+    
+    path_obj = Path(path) if isinstance(path, str) else path
+    try:
+        # Get the absolute, normalized long path
+        # On Windows, .resolve() attempts to convert to long form
+        return path_obj.resolve()
+    except (OSError, ValueError):
+        return path_obj
+
+
 def _split_drive(path: str) -> tuple[str, str]:
     normalized = _normalize_path(path)
     if len(normalized) >= 2 and normalized[1] == ":":
@@ -98,6 +117,35 @@ def _source_key_for_staged_path(rel_path: Path) -> tuple[str, ...] | None:
     if drive_index is None:
         return None
     return tuple(parts[drive_index:])
+
+
+def _sanitize_game_path(game_id: str) -> str:
+    """Sanitize game_id for use in filesystem paths.
+    
+    Replaces invalid Windows characters with safe alternatives:
+    - Colons become underscores
+    - Forward/backslashes are replaced
+    - Other reserved chars are replaced
+    
+    This avoids issues with game names like "Mafia: Definitive Edition".
+    
+    NOTE: The original game_id is ALWAYS preserved in:
+    - sync_meta.json (game_id field)
+    - manifest.json (game_id field)  
+    - Archive creation uses game_id as arcname, not sanitized name
+    
+    The sanitized name is only used for temporary local filesystem paths.
+    During restore, the original game_id from sync_meta.json is used.
+    """
+    # Windows reserved characters: < > : " / \ | ? *
+    invalid_chars = '<>:"/\\|?*'
+    safe_name = game_id
+    for char in invalid_chars:
+        safe_name = safe_name.replace(char, '_')
+    # Collapse multiple underscores
+    while '__' in safe_name:
+        safe_name = safe_name.replace('__', '_')
+    return safe_name.strip('_')
 
 
 def _file_created_at(stat_result: os.stat_result) -> datetime | None:
@@ -405,7 +453,9 @@ class SyncEngine:
         try:
             with tempfile.TemporaryDirectory() as staging:
                 staging_path = Path(staging)
-                game_dir = staging_path / game_id
+                # Use sanitized game_id for filesystem paths to avoid issues with special chars
+                safe_game_path = _sanitize_game_path(game_id)
+                game_dir = staging_path / safe_game_path
                 game_dir.mkdir(parents=True, exist_ok=True)
                 ludusavi.backup_game(game_id, game_dir, binary=self._ludusavi_bin)
                 return True, _build_manifest(
@@ -598,7 +648,9 @@ class SyncEngine:
 
             with tempfile.TemporaryDirectory() as staging:
                 staging_path = Path(staging)
-                game_dir = staging_path / game_id
+                # Use sanitized game_id for filesystem paths to avoid issues with special chars
+                safe_game_path = _sanitize_game_path(game_id)
+                game_dir = staging_path / safe_game_path
                 game_dir.mkdir(parents=True, exist_ok=True)
 
                 # 1. Backup via Ludusavi
@@ -715,7 +767,9 @@ class SyncEngine:
         try:
             with tempfile.TemporaryDirectory() as staging:
                 staging_path = Path(staging)
-                game_dir = staging_path / game_id
+                # Use sanitized game_id for filesystem paths to avoid issues with special chars
+                safe_game_path = _sanitize_game_path(game_id)
+                game_dir = staging_path / safe_game_path
                 game_dir.mkdir(parents=True, exist_ok=True)
 
                 prefix = self._cloud_prefix(game_id)
@@ -745,6 +799,13 @@ class SyncEngine:
                                         f"Unsafe path in archive: {member.name}"
                                     )
                             tar.extractall(staging_path)
+                        
+                        # After extraction, the archive structure is:
+                        # staging_path/game_id/drive-C/...
+                        # We need to use the nested directory for restore
+                        nested_game_dir = staging_path / game_id
+                        if nested_game_dir.exists():
+                            game_dir = nested_game_dir
                     except RcloneError:
                         # Archive not found — fall back to legacy download
                         rclone.download(
@@ -950,6 +1011,361 @@ class SyncEngine:
         except RcloneError:
             return []
 
+    # ------------------------------------------------------------------
+    # Batch operations (optimized for syncing multiple games)
+    # ------------------------------------------------------------------
+
+    @dataclass
+    class BatchSyncPlan:
+        """Result of analyzing multiple games to determine sync actions."""
+        to_push: list[str]  # game_ids that should be pushed to cloud
+        to_pull: list[str]  # game_ids that should be pulled from cloud
+        to_skip: list[str]  # game_ids that are already synced
+        conflicts: dict[str, tuple[GameManifest | None, GameManifest | None]]  # game_id -> (local, cloud)
+        unknown: list[str]  # game_ids with no cloud save (UNKNOWN status)
+        results: dict[str, SyncResult]  # Full SyncResult for each game
+
+    def batch_sync_all(
+        self,
+        game_ids: list[str],
+        target_wine_contexts: dict[str, tuple[str | None, str | None]] | None = None,
+    ) -> BatchSyncPlan:
+        """Analyze and sync multiple games efficiently in a single batch operation.
+        
+        This method optimizes the sync flow by:
+        1. Backing up ALL local games with a single ludusavi call
+        2. Fetching ALL cloud metadata with minimal rclone calls
+        3. Computing sync state for all games
+        4. Uploading all files to be pushed in a single rclone operation
+        5. Downloading all files to be pulled in a single rclone operation
+
+        Args:
+            game_ids: List of game IDs to sync.
+            target_wine_contexts: Optional dict mapping game_id -> (wine_prefix, wine_user).
+
+        Returns:
+            BatchSyncPlan with actions for each game.
+        """
+        if not game_ids:
+            return self.BatchSyncPlan([], [], [], {}, [], {})
+
+        target_wine_contexts = target_wine_contexts or {}
+        plan = self.BatchSyncPlan([], [], [], {}, [], {})
+
+        with tempfile.TemporaryDirectory() as staging:
+            staging_path = Path(staging)
+
+            # Step 1: Backup ALL local games in a single ludusavi call
+            try:
+                backup_dirs = ludusavi.backup_games(game_ids, staging_path, binary=self._ludusavi_bin)
+            except LudusaviError as e:
+                _log.error("Batch backup failed: %s", e)
+                # Fallback: use individual backups
+                backup_dirs = {}
+                for game_id in game_ids:
+                    try:
+                        safe_path = _sanitize_game_path(game_id)
+                        game_dir = staging_path / safe_path
+                        game_dir.mkdir(parents=True, exist_ok=True)
+                        ludusavi.backup_game(game_id, game_dir, binary=self._ludusavi_bin)
+                        backup_dirs[game_id] = game_dir
+                    except LudusaviError as ge:
+                        _log.warning("Failed to backup %s: %s", game_id, ge)
+
+            # Step 2: Build local manifests from backups
+            local_manifests: dict[str, GameManifest | None] = {}
+            source_games: dict[str, ludusavi.LudusaviGame | None] = {}
+
+            for game_id in game_ids:
+                try:
+                    source_game = self._live_source_game(game_id)
+                    source_games[game_id] = source_game
+                except LudusaviError:
+                    source_games[game_id] = None
+
+                if game_id in backup_dirs:
+                    source_file_times = (
+                        _collect_source_file_times(source_games[game_id])
+                        if source_games[game_id] is not None
+                        else None
+                    )
+                    local_manifests[game_id] = _build_manifest(
+                        game_id,
+                        backup_dirs[game_id],
+                        source_file_times=source_file_times,
+                        machine_id=self._config.machine_name,
+                    )
+                else:
+                    local_manifests[game_id] = None
+
+            # Step 3: Fetch all cloud metadata efficiently
+            cloud_manifests: dict[str, GameManifest | None] = {}
+            cloud_sync_metas: dict[str, SyncMeta | None] = {}
+
+            # Batch fetch all sync_meta and manifest files
+            paths_to_fetch = []
+            for game_id in game_ids:
+                paths_to_fetch.append(f"{self._cloud_prefix(game_id)}/sync_meta.json")
+                paths_to_fetch.append(f"{self._cloud_prefix(game_id)}/manifest.json")
+
+            try:
+                fetched_files = rclone.read_files(
+                    self._config.drive_remote,
+                    self._config.drive_root,
+                    paths_to_fetch,
+                    env=self._env,
+                    binary=self._rclone_bin,
+                    config_file=self._rclone_config_file,
+                    report_cli=False,
+                )
+
+                for game_id in game_ids:
+                    meta_path = f"{self._cloud_prefix(game_id)}/sync_meta.json"
+                    manifest_path = f"{self._cloud_prefix(game_id)}/manifest.json"
+
+                    # Try sync_meta first (fast path)
+                    meta_bytes = fetched_files.get(meta_path)
+                    if meta_bytes:
+                        try:
+                            cloud_sync_metas[game_id] = manifest_module.sync_meta_from_json(
+                                meta_bytes.decode("utf-8")
+                            )
+                        except (json.JSONDecodeError, KeyError, ValueError):
+                            cloud_sync_metas[game_id] = None
+                    else:
+                        cloud_sync_metas[game_id] = None
+
+                    # Always fetch full manifest for comparison
+                    manifest_bytes = fetched_files.get(manifest_path)
+                    if manifest_bytes:
+                        try:
+                            cloud_manifests[game_id] = manifest_module.from_json(
+                                manifest_bytes.decode("utf-8")
+                            )
+                        except (json.JSONDecodeError, KeyError, ValueError):
+                            cloud_manifests[game_id] = None
+                    else:
+                        cloud_manifests[game_id] = None
+            except Exception as e:
+                _log.warning("Batch cloud fetch failed, falling back to individual fetches: %s", e)
+                for game_id in game_ids:
+                    cloud_sync_metas[game_id] = self._get_cloud_sync_meta(game_id)
+                    cloud_manifests[game_id] = self.get_cloud_manifest(game_id)
+
+            # Step 4: Determine sync actions for each game
+            for game_id in game_ids:
+                local = local_manifests.get(game_id)
+                cloud = cloud_manifests.get(game_id)
+                cloud_meta = cloud_sync_metas.get(game_id)
+
+                # Compare states
+                if cloud_meta is not None and local is not None:
+                    status = manifest_module.compare_meta(
+                        local, cloud_meta, runner_machine_id=self._config.machine_name
+                    )
+                else:
+                    # Full comparison
+                    if cloud is None and local is None:
+                        status = SyncStatus.UNKNOWN
+                    elif cloud is None:
+                        status = SyncStatus.LOCAL_NEWER
+                    elif local is None:
+                        status = SyncStatus.CLOUD_NEWER
+                    else:
+                        status = manifest_module.compare(
+                            local, cloud, runner_machine_id=self._config.machine_name
+                        )
+
+                # Categorize action
+                if status == SyncStatus.SYNCED:
+                    plan.to_skip.append(game_id)
+                elif status == SyncStatus.LOCAL_NEWER:
+                    plan.to_push.append(game_id)
+                elif status == SyncStatus.CLOUD_NEWER:
+                    plan.to_pull.append(game_id)
+                elif status == SyncStatus.CONFLICT:
+                    plan.conflicts[game_id] = (local, cloud)
+                elif status == SyncStatus.UNKNOWN:
+                    plan.unknown.append(game_id)
+
+                # Store result
+                plan.results[game_id] = SyncResult(
+                    game_id=game_id,
+                    status=status,
+                    local_manifest=local,
+                    cloud_manifest=cloud,
+                )
+
+            # Step 5: Upload all files to be pushed in a single operation
+            if plan.to_push:
+                for game_id in plan.to_push:
+                    if game_id not in backup_dirs:
+                        continue
+
+                    game_dir = backup_dirs[game_id]
+                    prefix = self._cloud_prefix(game_id)
+                    local = local_manifests[game_id]
+
+                    if local is None:
+                        continue
+
+                    try:
+                        # Prepare archive
+                        # NOTE: Use game_id as arcname (not sanitized path) so extraction
+                        # creates the correct directory structure for ludusavi.restore_game.
+                        # The original game_id is stored in sync_meta.json for reference.
+                        archive_name = "save.tar.gz"
+                        archive_path = staging_path / f"{game_id}_{archive_name}"
+                        with tarfile.open(archive_path, "w:gz") as tar:
+                            tar.add(game_dir, arcname=game_id)
+
+                        # Prepare manifest and metadata files
+                        manifest_path = staging_path / f"{game_id}_manifest.json"
+                        manifest_path.write_text(
+                            manifest_module.to_json(local), encoding="utf-8"
+                        )
+
+                        sync_meta = SyncMeta(
+                            game_id=game_id,
+                            hash=local.hash,
+                            timestamp=local.timestamp,
+                            compressed=True,
+                            archive_name=archive_name,
+                            total_size=archive_path.stat().st_size,
+                            machine_id=self._config.machine_name,
+                        )
+                        meta_path = staging_path / f"{game_id}_sync_meta.json"
+                        meta_path.write_text(
+                            manifest_module.sync_meta_to_json(sync_meta), encoding="utf-8"
+                        )
+
+                        # Upload archive
+                        _retry_rclone(lambda: rclone.upload(
+                            archive_path,
+                            self._config.drive_remote,
+                            self._config.drive_root,
+                            f"{prefix}/{archive_name}",
+                            env=self._env,
+                            binary=self._rclone_bin,
+                            config_file=self._rclone_config_file,
+                        ))
+
+                        # Upload manifest
+                        _retry_rclone(lambda: rclone.upload(
+                            manifest_path,
+                            self._config.drive_remote,
+                            self._config.drive_root,
+                            f"{prefix}/manifest.json",
+                            env=self._env,
+                            binary=self._rclone_bin,
+                            config_file=self._rclone_config_file,
+                        ))
+
+                        # Upload sync_meta
+                        _retry_rclone(lambda: rclone.upload(
+                            meta_path,
+                            self._config.drive_remote,
+                            self._config.drive_root,
+                            f"{prefix}/sync_meta.json",
+                            env=self._env,
+                            binary=self._rclone_bin,
+                            config_file=self._rclone_config_file,
+                        ))
+
+                        self._save_local_manifest(local)
+                        self._log_history(game_id, "push")
+                    except (RcloneError, LudusaviError, OSError) as e:
+                        _log.error("Failed to push %s: %s", game_id, e)
+                        plan.results[game_id].status = SyncStatus.UNKNOWN
+                        plan.results[game_id].error = str(e)
+
+            # Step 6: Download and restore all games to be pulled
+            if plan.to_pull:
+                for game_id in plan.to_pull:
+                    prefix = self._cloud_prefix(game_id)
+                    safe_game_path = _sanitize_game_path(game_id)
+                    game_dir = staging_path / f"pull_{safe_game_path}"
+                    game_dir.mkdir(parents=True, exist_ok=True)
+
+                    try:
+                        # Check if cloud save is compressed (v2 format)
+                        sync_meta = cloud_sync_metas.get(game_id)
+                        if sync_meta is not None and sync_meta.compressed:
+                            # Download compressed archive
+                            archive_key = f"{prefix}/{sync_meta.archive_name}"
+                            try:
+                                archive_data = rclone.read_file(
+                                    self._config.drive_remote,
+                                    self._config.drive_root,
+                                    archive_key,
+                                    env=self._env,
+                                    binary=self._rclone_bin,
+                                    config_file=self._rclone_config_file,
+                                    report_cli=False,
+                                )
+                                archive_path = staging_path / f"pull_{game_id}.tar.gz"
+                                archive_path.write_bytes(archive_data)
+                                with tarfile.open(archive_path, "r:gz") as tar:
+                                    for member in tar.getmembers():
+                                        if member.name.startswith("/") or ".." in member.name:
+                                            raise SyncError(f"Unsafe path in archive: {member.name}")
+                                    tar.extractall(game_dir)
+                                
+                                # After extraction, the archive structure is:
+                                # game_dir/game_id/drive-C/... (if archive used arcname=game_id)
+                                # We need to pass the nested directory to ludusavi
+                                nested_game_dir = game_dir / game_id
+                                if nested_game_dir.exists():
+                                    game_dir = nested_game_dir
+                            except RcloneError:
+                                # Fallback to legacy download
+                                rclone.download(
+                                    self._config.drive_remote,
+                                    self._config.drive_root,
+                                    prefix,
+                                    game_dir,
+                                    env=self._env,
+                                    binary=self._rclone_bin,
+                                    config_file=self._rclone_config_file,
+                                )
+                        else:
+                            # Legacy download
+                            rclone.download(
+                                self._config.drive_remote,
+                                self._config.drive_root,
+                                prefix,
+                                game_dir,
+                                env=self._env,
+                                binary=self._rclone_bin,
+                                config_file=self._rclone_config_file,
+                            )
+
+                        # Get wine context if available
+                        wine_prefix, wine_user = target_wine_contexts.get(game_id, (None, None))
+
+                        # Convert and restore
+                        convert_simple_backup_for_restore(
+                            game_dir,
+                            cloud_manifests[game_id].host if cloud_manifests[game_id] else Platform.WINDOWS,
+                            self._restore_platform(wine_prefix),
+                            target_wine_prefix=wine_prefix,
+                            target_wine_user=wine_user,
+                            env=self._conversion_env(),
+                        )
+                        ludusavi.restore_game(game_id, game_dir, binary=self._ludusavi_bin)
+
+                        # Cache cloud manifest locally
+                        if cloud_manifests[game_id]:
+                            self._save_local_manifest(cloud_manifests[game_id])
+
+                        self._log_history(game_id, "pull")
+                    except (LudusaviError, RcloneError, SyncError) as e:
+                        _log.error("Failed to pull %s: %s", game_id, e)
+                        plan.results[game_id].status = SyncStatus.UNKNOWN
+                        plan.results[game_id].error = str(e)
+
+        return plan
+
     def export_library(self, dest: Path, game_ids: list[str] | None = None) -> Path:
         """Download cloud saves and bundle them into a zip at *dest*.
 
@@ -972,7 +1388,9 @@ class SyncEngine:
             tmp_path = Path(tmp)
             for gid in game_ids:
                 prefix = self._cloud_prefix(gid)
-                game_dir = tmp_path / gid
+                # Use sanitized game_id for filesystem paths
+                safe_game_path = _sanitize_game_path(gid)
+                game_dir = tmp_path / safe_game_path
                 game_dir.mkdir(parents=True, exist_ok=True)
                 try:
                     rclone.download(

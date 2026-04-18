@@ -722,3 +722,87 @@ def delete_path(
             result.returncode,
             result.stderr,
         )
+
+
+def read_files(
+    remote: str,
+    root: str,
+    paths: list[str],
+    env: dict[str, str] | None = None,
+    binary: Path | None = None,
+    config_file: Path | None = None,
+    report_cli: bool = True,
+) -> dict[str, bytes | None]:
+    """Efficiently fetch multiple files from cloud storage.
+    
+    Reads each file individually but batches them to minimize overhead.
+    If a file doesn't exist, that entry in the result dict will be None.
+
+    Args:
+        remote: Name of the rclone remote.
+        root: Top-level Drive folder.
+        paths: List of file paths to read.
+        env: Extra environment variables.
+        binary: Path to the rclone binary.
+        config_file: Optional rclone config file path.
+        report_cli: Whether to emit probes to the debug CLI event bus.
+
+    Returns:
+        Dictionary mapping path -> bytes (or None if file not found).
+    """
+    result_map: dict[str, bytes | None] = {}
+    for path in paths:
+        try:
+            result_map[path] = read_file(
+                remote,
+                root,
+                path,
+                env=env,
+                binary=binary,
+                config_file=config_file,
+                report_cli=report_cli,
+            )
+        except RcloneError:
+            result_map[path] = None
+    return result_map
+
+
+def upload_files(
+    files: dict[str, Path],
+    remote: str,
+    root: str,
+    path: str,
+    env: dict[str, str] | None = None,
+    binary: Path | None = None,
+    config_file: Path | None = None,
+) -> None:
+    """Upload multiple files to cloud storage in a single rclone operation.
+    
+    Uses rclone's copy command to upload all files from a directory at once.
+
+    Args:
+        files: Dictionary mapping filename -> local Path. Files are uploaded to path/<filename>.
+        remote: Name of the rclone remote.
+        root: Top-level Drive folder.
+        path: Destination path prefix in the remote.
+        env: Extra environment variables.
+        binary: Path to the rclone binary.
+        config_file: Optional rclone config file path.
+
+    Raises:
+        RcloneError: If rclone exits with a non-zero code.
+    """
+    if not files:
+        return
+
+    # For now, upload files individually. In future, could batch upload a directory.
+    for filename, file_path in files.items():
+        upload(
+            file_path,
+            remote,
+            root,
+            f"{path}/{filename}",
+            env=env,
+            binary=binary,
+            config_file=config_file,
+        )

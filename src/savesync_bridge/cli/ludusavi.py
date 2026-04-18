@@ -212,3 +212,64 @@ def restore_game(
             result.returncode,
             result.stderr,
         )
+
+
+def backup_games(
+    game_names: list[str],
+    output_dir: Path,
+    binary: Path | None = None,
+) -> dict[str, Path]:
+    """Run `ludusavi backup --api --path <output_dir>` for multiple games in a single call.
+
+    This is more efficient than calling backup_game() repeatedly, as it batches
+    all backups into a single ludusavi invocation.
+
+    Args:
+        game_names: List of Ludusavi game identifiers.
+        output_dir: Directory where Ludusavi will write the backups.
+        binary: Path to the ludusavi binary. Defaults to ``resolve_ludusavi()``.
+
+    Returns:
+        Dictionary mapping game_name to the directory containing its backup.
+
+    Raises:
+        LudusaviError: If ludusavi exits with a non-zero code or outputs invalid JSON.
+    """
+    if not game_names:
+        return {}
+
+    if binary is None:
+        binary = resolve_ludusavi()
+
+    cmd = [str(binary), "backup", "--api", "--force", "--path", str(output_dir)]
+    cmd.extend(game_names)
+
+    result = _run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        raise LudusaviError(
+            f"ludusavi backup failed: {result.stderr}",
+            result.returncode,
+            result.stderr,
+        )
+
+    try:
+        json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise LudusaviError(
+            f"ludusavi returned invalid JSON: {exc}",
+            0,
+            result.stderr,
+        ) from exc
+
+    # Return mapping of game_name -> backup_dir
+    result_mapping: dict[str, Path] = {}
+    for game_name in game_names:
+        result_mapping[game_name] = output_dir / game_name
+
+    return result_mapping
