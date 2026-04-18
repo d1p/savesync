@@ -7,15 +7,12 @@ import pytest
 
 from savesync_bridge.core.manifest import (
     compare,
-    compare_meta,
     compute_confidence,
     diff_manifests,
     from_json,
     latest_modified,
     oldest_known_created,
     recommend_lineage,
-    sync_meta_from_json,
-    sync_meta_to_json,
     to_json,
     append_sync_history,
     load_sync_history,
@@ -25,7 +22,7 @@ from savesync_bridge.core.manifest import (
     ManifestDiff,
     SyncHistoryEntry,
 )
-from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncMeta, SyncStatus
+from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncStatus
 
 _UTC = UTC
 _T0 = datetime(2026, 4, 12, 10, 0, 0, tzinfo=_UTC)
@@ -227,148 +224,6 @@ def test_recommend_lineage_prefers_local_when_cloud_looks_fresh() -> None:
 
 
 # ---------------------------------------------------------------------------
-# SyncMeta round-trip
-# ---------------------------------------------------------------------------
-
-
-def _sync_meta(
-    game_id: str = "Celeste",
-    hash_: str = "sha256:aabbcc",
-    timestamp: datetime = _T0,
-    compressed: bool = True,
-    archive_name: str = "save.tar.gz",
-    total_size: int = 4096,
-    machine_id: str = "",
-) -> SyncMeta:
-    return SyncMeta(
-        game_id=game_id,
-        hash=hash_,
-        timestamp=timestamp,
-        compressed=compressed,
-        archive_name=archive_name,
-        total_size=total_size,
-        machine_id=machine_id,
-    )
-
-
-def test_sync_meta_round_trip() -> None:
-    meta = _sync_meta()
-    restored = sync_meta_from_json(sync_meta_to_json(meta))
-    assert restored == meta
-
-
-def test_sync_meta_json_contains_version() -> None:
-    meta = _sync_meta()
-    obj = json.loads(sync_meta_to_json(meta))
-    assert obj["version"] == 2
-
-
-def test_sync_meta_from_json_legacy_defaults() -> None:
-    """Parsing JSON without compressed/archive_name fields uses defaults."""
-    data = json.dumps({
-        "game_id": "Hades",
-        "hash": "sha256:abc",
-        "timestamp": _T0.isoformat(),
-    })
-    meta = sync_meta_from_json(data)
-    assert meta.compressed is False
-    assert meta.archive_name == ""
-
-
-# ---------------------------------------------------------------------------
-# compare_meta
-# ---------------------------------------------------------------------------
-
-
-def test_compare_meta_synced() -> None:
-    local = _manifest(hash_="sha256:same")
-    cloud = _sync_meta(hash_="sha256:same")
-    assert compare_meta(local, cloud) == SyncStatus.SYNCED
-
-
-def test_compare_meta_conflict_when_local_timestamp_is_newer_but_hash_differs() -> None:
-    local = _manifest(timestamp=_T2, hash_="sha256:local")
-    cloud = _sync_meta(timestamp=_T1, hash_="sha256:cloud")
-    assert compare_meta(local, cloud) == SyncStatus.CONFLICT
-
-
-def test_compare_meta_conflict_when_cloud_timestamp_is_newer_but_hash_differs() -> None:
-    local = _manifest(timestamp=_T1, hash_="sha256:local")
-    cloud = _sync_meta(timestamp=_T2, hash_="sha256:cloud")
-    assert compare_meta(local, cloud) == SyncStatus.CONFLICT
-
-
-def test_compare_meta_conflict() -> None:
-    local = _manifest(timestamp=_T1, hash_="sha256:a")
-    cloud = _sync_meta(timestamp=_T1, hash_="sha256:b")
-    assert compare_meta(local, cloud) == SyncStatus.CONFLICT
-
-
-def test_compare_meta_smart_machine_id_same_machine_newer_local() -> None:
-    """If local came from same machine and is newer, return LOCAL_NEWER instead of CONFLICT."""
-    local = _manifest(
-        timestamp=_T2,
-        hash_="sha256:local",
-        machine_id="my-machine",
-    )
-    cloud = _sync_meta(timestamp=_T1, hash_="sha256:cloud", machine_id="my-machine")
-    # Without machine_id: would be CONFLICT
-    assert compare_meta(local, cloud) == SyncStatus.CONFLICT
-    # With matching machine_id and local newer: LOCAL_NEWER
-    assert compare_meta(local, cloud, runner_machine_id="my-machine") == SyncStatus.LOCAL_NEWER
-    # Case-insensitive comparison
-    assert compare_meta(local, cloud, runner_machine_id="MY-MACHINE") == SyncStatus.LOCAL_NEWER
-
-
-def test_compare_meta_smart_machine_id_same_machine_older_local() -> None:
-    """If local came from same machine but is older, return CONFLICT (don't trust timestamp alone)."""
-    local = _manifest(
-        timestamp=_T1,
-        hash_="sha256:local",
-        machine_id="my-machine",
-    )
-    cloud = _sync_meta(timestamp=_T2, hash_="sha256:cloud", machine_id="my-machine")
-    # Local is older; still CONFLICT
-    assert compare_meta(local, cloud, runner_machine_id="my-machine") == SyncStatus.CONFLICT
-
-
-def test_compare_meta_smart_machine_id_different_machine() -> None:
-    """If local came from different machine, ignore timestamp and return CONFLICT."""
-    local = _manifest(
-        timestamp=_T2,
-        hash_="sha256:local",
-        machine_id="machine-a",
-    )
-    cloud = _sync_meta(timestamp=_T1, hash_="sha256:cloud", machine_id="machine-b")
-    # Even though local is newer and machine_id is provided, it doesn't match local
-    assert compare_meta(local, cloud, runner_machine_id="machine-b") == SyncStatus.CONFLICT
-
-
-def test_compare_smart_machine_id_same_machine_newer_local() -> None:
-    """Full compare() also respects machine ID: same machine, local newer -> LOCAL_NEWER."""
-    local = _manifest(
-        timestamp=_T2,
-        hash_="sha256:local",
-        machine_id="laptop",
-        files=(
-            SaveFile(path="save.dat", size=100, modified=_T2, file_hash="sha256:abc"),
-        ),
-    )
-    cloud = _manifest(
-        timestamp=_T1,
-        hash_="sha256:cloud",
-        machine_id="laptop",
-        files=(
-            SaveFile(path="save.dat", size=100, modified=_T1, file_hash="sha256:xyz"),
-        ),
-    )
-    # Without machine_id: CONFLICT
-    assert compare(local, cloud) == SyncStatus.CONFLICT
-    # With matching machine_id and local newer: LOCAL_NEWER
-    assert compare(local, cloud, runner_machine_id="laptop") == SyncStatus.LOCAL_NEWER
-
-
-# ---------------------------------------------------------------------------
 # compute_confidence
 # ---------------------------------------------------------------------------
 
@@ -528,17 +383,6 @@ def test_round_trip_machine_id_defaults_empty() -> None:
     json_str = to_json(m)
     restored = from_json(json_str)
     assert restored.machine_id == ""
-
-
-def test_sync_meta_round_trip_machine_id() -> None:
-    meta = SyncMeta(
-        game_id="Celeste", hash="sha256:abc", timestamp=_T0,
-        compressed=True, archive_name="save.tar.gz", total_size=1024,
-        machine_id="deck-linux",
-    )
-    json_str = sync_meta_to_json(meta)
-    restored = sync_meta_from_json(json_str)
-    assert restored.machine_id == "deck-linux"
 
 
 # ---------------------------------------------------------------------------

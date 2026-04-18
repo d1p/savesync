@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
-from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncMeta, SyncStatus
+from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncStatus
 
 LineageRecommendation = Literal["local", "cloud"]
 
@@ -50,6 +50,9 @@ def to_json(manifest: GameManifest) -> str:
         "timestamp": manifest.timestamp.isoformat(),
         "hash": manifest.hash,
         "machine_id": manifest.machine_id,
+        "compressed": manifest.compressed,
+        "archive_name": manifest.archive_name,
+        "total_size": manifest.total_size,
         "files": [
             {
                 "path": f.path,
@@ -100,6 +103,9 @@ def from_json(data: str) -> GameManifest:
         hash=obj["hash"],
         files=files,
         machine_id=obj.get("machine_id", ""),
+        compressed=obj.get("compressed", False),
+        archive_name=obj.get("archive_name", "save.tar.gz"),
+        total_size=obj.get("total_size", 0),
     )
 
 
@@ -157,71 +163,6 @@ def compare(local: GameManifest, cloud: GameManifest, runner_machine_id: str | N
     ):
         return SyncStatus.SYNCED
 
-    return SyncStatus.CONFLICT
-
-
-# ---------------------------------------------------------------------------
-# SyncMeta — lightweight metadata for quick cloud checks
-# ---------------------------------------------------------------------------
-
-
-def sync_meta_to_json(meta: SyncMeta) -> str:
-    """Serialise a SyncMeta to a JSON string."""
-    data: dict = {
-        "version": 2,
-        "game_id": meta.game_id,
-        "hash": meta.hash,
-        "timestamp": meta.timestamp.isoformat(),
-        "compressed": meta.compressed,
-        "archive_name": meta.archive_name,
-        "total_size": meta.total_size,
-        "machine_id": meta.machine_id,
-    }
-    return json.dumps(data, indent=2)
-
-
-def sync_meta_from_json(data: str) -> SyncMeta:
-    """Deserialise a SyncMeta from a JSON string."""
-    obj = json.loads(data)
-    return SyncMeta(
-        game_id=obj["game_id"],
-        hash=obj["hash"],
-        timestamp=datetime.fromisoformat(obj["timestamp"]),
-        compressed=obj.get("compressed", False),
-        archive_name=obj.get("archive_name", ""),
-        total_size=obj.get("total_size", 0),
-        machine_id=obj.get("machine_id", ""),
-    )
-
-
-def compare_meta(local: GameManifest, cloud_meta: SyncMeta, runner_machine_id: str | None = None) -> SyncStatus:
-    """Compare a local manifest with a lightweight cloud SyncMeta.
-    
-    Args:
-        local: Local game manifest.
-        cloud_meta: Lightweight cloud metadata.
-        runner_machine_id: The current runner/machine ID. If provided and matches local's
-            machine_id, and local.timestamp > cloud_meta.timestamp, returns LOCAL_NEWER to skip
-            conflict resolution.
-    
-    Returns:
-        - :attr:`~SyncStatus.SYNCED` — hashes match.
-        - :attr:`~SyncStatus.LOCAL_NEWER` — local timestamp is newer and originated from same machine.
-        - :attr:`~SyncStatus.CONFLICT` — hashes differ.
-    """
-    if local.hash == cloud_meta.hash:
-        return SyncStatus.SYNCED
-    
-    # Smart machine ID check: if this is the same machine that created the local
-    # save and it's newer than cloud, just push without conflict resolution
-    if (
-        runner_machine_id
-        and local.machine_id
-        and runner_machine_id.lower() == local.machine_id.lower()
-        and local.timestamp > cloud_meta.timestamp
-    ):
-        return SyncStatus.LOCAL_NEWER
-    
     return SyncStatus.CONFLICT
 
 

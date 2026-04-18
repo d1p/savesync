@@ -30,17 +30,7 @@ class SaveFile:
 
 @dataclass(frozen=True)
 class GameManifest:
-    game_id: str
-    host: Platform
-    timestamp: datetime
-    hash: str
-    files: tuple[SaveFile, ...]
-    machine_id: str = ""  # identifies the originating machine
-
-
-@dataclass(frozen=True)
-class SyncMeta:
-    """Lightweight metadata for quick cloud status checks without downloading full manifest.
+    """Complete game manifest with all metadata for fast comparison and restore.
     
     IMPORTANT: The `game_id` field contains the ORIGINAL, unmodified Ludusavi game identifier,
     even if the game name contains special characters like colons. This is used to:
@@ -49,16 +39,22 @@ class SyncMeta:
     - Track sync history per actual game
     
     Temporary filesystem paths may use sanitized versions of game_id (colons → underscores),
-    but this metadata always preserves the original.
+    but this manifest always preserves the original.
+    
+    Combined manifest design:
+    - All metadata needed for status checks (hash comparison) is here
+    - All metadata needed for detailed diffs is here
+    - Only the actual save.tar.gz is downloaded separately when pulling
     """
-
     game_id: str  # Original Ludusavi game identifier (e.g., "Mafia: Definitive Edition")
-    hash: str
+    host: Platform
     timestamp: datetime
-    compressed: bool = False
-    archive_name: str = ""
-    total_size: int = 0
+    hash: str
+    files: tuple[SaveFile, ...]
     machine_id: str = ""  # identifies the originating machine
+    compressed: bool = False  # whether save archive is compressed (tar.gz)
+    archive_name: str = "save.tar.gz"  # name of the save archive file
+    total_size: int = 0  # total size of compressed archive (0 if uncompressed)
 
 
 @dataclass(frozen=True)

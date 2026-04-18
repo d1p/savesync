@@ -17,7 +17,7 @@ from savesync_bridge.core import manifest as manifest_module
 from savesync_bridge.core.backup_converter import convert_simple_backup_for_restore
 from savesync_bridge.core.config import AppConfig, default_machine_name
 from savesync_bridge.core.exceptions import LudusaviError, RcloneError, SyncError
-from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncMeta, SyncStatus
+from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncStatus
 
 import logging
 import time
@@ -130,12 +130,11 @@ def _sanitize_game_path(game_id: str) -> str:
     This avoids issues with game names like "Mafia: Definitive Edition".
     
     NOTE: The original game_id is ALWAYS preserved in:
-    - sync_meta.json (game_id field)
-    - manifest.json (game_id field)  
+    - manifest.json (game_id field)
     - Archive creation uses game_id as arcname, not sanitized name
     
     The sanitized name is only used for temporary local filesystem paths.
-    During restore, the original game_id from sync_meta.json is used.
+    During restore, the original game_id from manifest.json is used.
     """
     # Windows reserved characters: < > : " / \ | ? *
     invalid_chars = '<>:"/\\|?*'
@@ -499,10 +498,11 @@ class SyncEngine:
 
         # Copy current live files to a versioned slot
         try:
-            current_meta = self._get_cloud_sync_meta(game_id)
-            if current_meta is not None:
+            current_manifest = self.get_cloud_manifest(game_id)
+            if current_manifest is not None:
                 dest_prefix = f"{versions_prefix}/v{next_version}"
-                for fname in ("save.tar.gz", "manifest.json", "sync_meta.json"):
+                # Only copy archive and manifest (manifest now contains all metadata)
+                for fname in ("save.tar.gz", "manifest.json"):
                     src_key = f"{prefix}/{fname}"
                     try:
                         data = rclone.read_file(
@@ -575,12 +575,10 @@ class SyncEngine:
         """
         try:
             cloud_manifest = self.get_cloud_manifest(game_id)
-            cloud_meta = self._get_cloud_sync_meta(game_id)
-            if cloud_manifest is None or cloud_meta is None:
-                return False, "Missing cloud manifest or sync metadata"
-            if cloud_manifest.hash != cloud_meta.hash:
-                return False, f"Hash mismatch: manifest={cloud_manifest.hash}, meta={cloud_meta.hash}"
-            return True, f"Integrity OK — hash {cloud_meta.hash}"
+            if cloud_manifest is None:
+                return False, "Missing cloud manifest"
+            # Manifest now contains all metadata and compression info
+            return True, f"Integrity OK — hash {cloud_manifest.hash}"
         except Exception as exc:
             return False, f"Verification error: {exc}"
 
@@ -605,29 +603,17 @@ class SyncEngine:
         except RcloneError:
             return None
 
-    def _get_cloud_sync_meta(self, game_id: str) -> SyncMeta | None:
-        """Fetch lightweight sync_meta.json from cloud. Returns ``None`` if absent."""
-        key = f"{self._cloud_prefix(game_id)}/sync_meta.json"
-        try:
-            raw = rclone.read_file(
-                self._config.drive_remote,
-                self._config.drive_root,
-                key,
-                env=self._env,
-                binary=self._rclone_bin,
-                config_file=self._rclone_config_file,
-                report_cli=False,
-            )
-            return manifest_module.sync_meta_from_json(raw.decode("utf-8"))
-        except (RcloneError, json.JSONDecodeError, KeyError, ValueError):
-            return None
+    def _get_cloud_sync_meta(self, game_id: str) -> GameManifest | None:
+        """DEPRECATED: Use get_cloud_manifest() instead. Returns the manifest with compression metadata."""
+        manifest = self.get_cloud_manifest(game_id)
+        return manifest if manifest is not None else None
 
     def push(self, game_id: str) -> SyncResult:
         """Back up *game_id* via Ludusavi, compress, and upload to cloud storage.
 
         The save files are compressed into a tar.gz archive before uploading.
-        A lightweight sync_meta.json is uploaded alongside for fast status checks.
-        The full manifest.json is also uploaded for backward compatibility.
+        The manifest.json contains all metadata including compression info and file hashes
+        for fast status checks and detailed diffs without requiring separate files.
         Older versions are retained up to ``config.max_versions``.
         """
         try:
@@ -671,31 +657,30 @@ class SyncEngine:
                     tar.add(game_dir, arcname=game_id)
                 archive_size = archive_path.stat().st_size
 
-                # 4. Write manifest.json into staging (backward compat)
-                manifest_file = staging_path / "manifest.json"
-                manifest_file.write_text(manifest_module.to_json(m), encoding="utf-8")
-
-                # 5. Write sync_meta.json (lightweight, for fast status check)
-                sync_meta = SyncMeta(
-                    game_id=game_id,
-                    hash=m.hash,
+                # 4. Create manifest with compression metadata
+                # This replaces the old separate sync_meta.json — all metadata in one file
+                m_with_archive_info = GameManifest(
+                    game_id=m.game_id,
+                    host=m.host,
                     timestamp=m.timestamp,
+                    hash=m.hash,
+                    files=m.files,
+                    machine_id=m.machine_id,
                     compressed=True,
                     archive_name=archive_name,
                     total_size=archive_size,
-                    machine_id=self._config.machine_name,
                 )
-                meta_file = staging_path / "sync_meta.json"
-                meta_file.write_text(
-                    manifest_module.sync_meta_to_json(sync_meta), encoding="utf-8",
-                )
+
+                # 5. Write manifest.json with all metadata
+                manifest_file = staging_path / "manifest.json"
+                manifest_file.write_text(manifest_module.to_json(m_with_archive_info), encoding="utf-8")
 
                 prefix = self._cloud_prefix(game_id)
 
-                # 5b. Rotate old versions before uploading new one
+                # 6. Rotate old versions before uploading new one
                 self._rotate_versions(game_id, prefix)
 
-                # 6. Upload compressed archive (single file instead of many)
+                # 7. Upload compressed archive (single file instead of many)
                 _retry_rclone(lambda: rclone.upload(
                     archive_path,
                     self._config.drive_remote,
@@ -706,20 +691,9 @@ class SyncEngine:
                     config_file=self._rclone_config_file,
                 ))
 
-                # 7. Upload manifest.json
+                # 8. Upload manifest.json (contains all metadata: files, hash, compression info)
                 _retry_rclone(lambda: rclone.upload(
                     manifest_file,
-                    self._config.drive_remote,
-                    self._config.drive_root,
-                    prefix,
-                    env=self._env,
-                    binary=self._rclone_bin,
-                    config_file=self._rclone_config_file,
-                ))
-
-                # 8. Upload sync_meta.json
-                _retry_rclone(lambda: rclone.upload(
-                    meta_file,
                     self._config.drive_remote,
                     self._config.drive_root,
                     prefix,
@@ -775,10 +749,10 @@ class SyncEngine:
                 prefix = self._cloud_prefix(game_id)
 
                 # Check if cloud save is compressed (v2 format)
-                sync_meta = self._get_cloud_sync_meta(game_id)
-                if sync_meta is not None and sync_meta.compressed:
+                # The manifest now contains this info directly
+                if manifest.compressed:
                     # Download compressed archive
-                    archive_key = f"{prefix}/{sync_meta.archive_name}"
+                    archive_key = f"{prefix}/{manifest.archive_name}"
                     try:
                         archive_data = rclone.read_file(
                             self._config.drive_remote,
@@ -789,7 +763,7 @@ class SyncEngine:
                             config_file=self._rclone_config_file,
                             report_cli=False,
                         )
-                        archive_path = staging_path / sync_meta.archive_name
+                        archive_path = staging_path / manifest.archive_name
                         archive_path.write_bytes(archive_data)
                         with tarfile.open(archive_path, "r:gz") as tar:
                             # Security: validate paths to prevent path traversal
@@ -855,10 +829,10 @@ class SyncEngine:
             return SyncResult(game_id=game_id, status=SyncStatus.UNKNOWN, error=str(exc))
 
     def check_status(self, game_id: str, *, use_live_local: bool = False) -> SyncResult:
-        """Compare the local cached manifest with the cloud sync metadata.
+        """Compare the local cached manifest with the cloud manifest.
 
-        Tries the lightweight sync_meta.json first for speed, then falls back
-        to the full manifest.json for backward compatibility.
+        The manifest.json now contains all metadata needed for comparison and status
+        checks, so no separate lightweight file is needed.
         
         Uses machine ID and timestamp checks to intelligently resolve local vs cloud
         conflicts: if the local version originated from the current machine and is
@@ -871,28 +845,7 @@ class SyncEngine:
         else:
             local = self._get_local_manifest(game_id)
 
-        # Fast path: try lightweight sync_meta.json
-        cloud_meta = self._get_cloud_sync_meta(game_id)
-        if cloud_meta is not None and local is not None:
-            status = manifest_module.compare_meta(local, cloud_meta, runner_machine_id=self._config.machine_name)
-            if status != SyncStatus.CONFLICT:
-                return SyncResult(game_id=game_id, status=status, local_manifest=local)
-
-            # Compatibility: an older cloud sync_meta hash may reflect ignored
-            # Ludusavi metadata like mapping.yaml. Fall back to the full manifest
-            # to compare the actual save payload.
-            cloud = self.get_cloud_manifest(game_id)
-            if cloud is None:
-                return SyncResult(game_id=game_id, status=status, local_manifest=local)
-            status = manifest_module.compare(local, cloud, runner_machine_id=self._config.machine_name)
-            return SyncResult(
-                game_id=game_id,
-                status=status,
-                local_manifest=local,
-                cloud_manifest=cloud,
-            )
-
-        # Slow path: fall back to full manifest
+        # Fetch cloud manifest - it now contains all metadata for comparison
         cloud = self.get_cloud_manifest(game_id)
 
         if cloud is None and local is None:
@@ -904,6 +857,7 @@ class SyncEngine:
         if local is None:
             return SyncResult(game_id=game_id, status=SyncStatus.CLOUD_NEWER, cloud_manifest=cloud)
 
+        # Compare manifests directly - no separate sync_meta needed
         status = manifest_module.compare(local, cloud, runner_machine_id=self._config.machine_name)
         return SyncResult(
             game_id=game_id,
@@ -1098,14 +1052,13 @@ class SyncEngine:
                 else:
                     local_manifests[game_id] = None
 
-            # Step 3: Fetch all cloud metadata efficiently
+            # Step 3: Fetch all cloud manifests efficiently
+            # Manifests now contain all metadata (compression info, file hashes, etc.)
             cloud_manifests: dict[str, GameManifest | None] = {}
-            cloud_sync_metas: dict[str, SyncMeta | None] = {}
 
-            # Batch fetch all sync_meta and manifest files
+            # Batch fetch all manifest files
             paths_to_fetch = []
             for game_id in game_ids:
-                paths_to_fetch.append(f"{self._cloud_prefix(game_id)}/sync_meta.json")
                 paths_to_fetch.append(f"{self._cloud_prefix(game_id)}/manifest.json")
 
             try:
@@ -1120,22 +1073,7 @@ class SyncEngine:
                 )
 
                 for game_id in game_ids:
-                    meta_path = f"{self._cloud_prefix(game_id)}/sync_meta.json"
                     manifest_path = f"{self._cloud_prefix(game_id)}/manifest.json"
-
-                    # Try sync_meta first (fast path)
-                    meta_bytes = fetched_files.get(meta_path)
-                    if meta_bytes:
-                        try:
-                            cloud_sync_metas[game_id] = manifest_module.sync_meta_from_json(
-                                meta_bytes.decode("utf-8")
-                            )
-                        except (json.JSONDecodeError, KeyError, ValueError):
-                            cloud_sync_metas[game_id] = None
-                    else:
-                        cloud_sync_metas[game_id] = None
-
-                    # Always fetch full manifest for comparison
                     manifest_bytes = fetched_files.get(manifest_path)
                     if manifest_bytes:
                         try:
@@ -1149,32 +1087,25 @@ class SyncEngine:
             except Exception as e:
                 _log.warning("Batch cloud fetch failed, falling back to individual fetches: %s", e)
                 for game_id in game_ids:
-                    cloud_sync_metas[game_id] = self._get_cloud_sync_meta(game_id)
                     cloud_manifests[game_id] = self.get_cloud_manifest(game_id)
 
             # Step 4: Determine sync actions for each game
             for game_id in game_ids:
                 local = local_manifests.get(game_id)
                 cloud = cloud_manifests.get(game_id)
-                cloud_meta = cloud_sync_metas.get(game_id)
 
-                # Compare states
-                if cloud_meta is not None and local is not None:
-                    status = manifest_module.compare_meta(
-                        local, cloud_meta, runner_machine_id=self._config.machine_name
-                    )
+                # Compare states using full manifest comparison
+                # (manifest now contains all necessary metadata)
+                if cloud is None and local is None:
+                    status = SyncStatus.UNKNOWN
+                elif cloud is None:
+                    status = SyncStatus.LOCAL_NEWER
+                elif local is None:
+                    status = SyncStatus.CLOUD_NEWER
                 else:
-                    # Full comparison
-                    if cloud is None and local is None:
-                        status = SyncStatus.UNKNOWN
-                    elif cloud is None:
-                        status = SyncStatus.LOCAL_NEWER
-                    elif local is None:
-                        status = SyncStatus.CLOUD_NEWER
-                    else:
-                        status = manifest_module.compare(
-                            local, cloud, runner_machine_id=self._config.machine_name
-                        )
+                    status = manifest_module.compare(
+                        local, cloud, runner_machine_id=self._config.machine_name
+                    )
 
                 # Categorize action
                 if status == SyncStatus.SYNCED:
@@ -1213,30 +1144,31 @@ class SyncEngine:
                         # Prepare archive
                         # NOTE: Use game_id as arcname (not sanitized path) so extraction
                         # creates the correct directory structure for ludusavi.restore_game.
-                        # The original game_id is stored in sync_meta.json for reference.
+                        # The original game_id is stored in the manifest.json for reference.
                         archive_name = "save.tar.gz"
                         archive_path = staging_path / f"{game_id}_{archive_name}"
                         with tarfile.open(archive_path, "w:gz") as tar:
                             tar.add(game_dir, arcname=game_id)
 
-                        # Prepare manifest and metadata files
-                        manifest_path = staging_path / f"{game_id}_manifest.json"
-                        manifest_path.write_text(
-                            manifest_module.to_json(local), encoding="utf-8"
-                        )
+                        archive_size = archive_path.stat().st_size
 
-                        sync_meta = SyncMeta(
-                            game_id=game_id,
-                            hash=local.hash,
+                        # Prepare manifest with compression metadata
+                        # Embed archive_name and total_size in manifest instead of separate file
+                        manifest_with_archive_info = GameManifest(
+                            game_id=local.game_id,
+                            host=local.host,
                             timestamp=local.timestamp,
+                            hash=local.hash,
+                            files=local.files,
+                            machine_id=local.machine_id,
                             compressed=True,
                             archive_name=archive_name,
-                            total_size=archive_path.stat().st_size,
-                            machine_id=self._config.machine_name,
+                            total_size=archive_size,
                         )
-                        meta_path = staging_path / f"{game_id}_sync_meta.json"
-                        meta_path.write_text(
-                            manifest_module.sync_meta_to_json(sync_meta), encoding="utf-8"
+
+                        manifest_path = staging_path / f"{game_id}_manifest.json"
+                        manifest_path.write_text(
+                            manifest_module.to_json(manifest_with_archive_info), encoding="utf-8"
                         )
 
                         # Upload archive
@@ -1250,23 +1182,12 @@ class SyncEngine:
                             config_file=self._rclone_config_file,
                         ))
 
-                        # Upload manifest
+                        # Upload manifest (contains all metadata: compression info, file hashes, etc.)
                         _retry_rclone(lambda: rclone.upload(
                             manifest_path,
                             self._config.drive_remote,
                             self._config.drive_root,
                             f"{prefix}/manifest.json",
-                            env=self._env,
-                            binary=self._rclone_bin,
-                            config_file=self._rclone_config_file,
-                        ))
-
-                        # Upload sync_meta
-                        _retry_rclone(lambda: rclone.upload(
-                            meta_path,
-                            self._config.drive_remote,
-                            self._config.drive_root,
-                            f"{prefix}/sync_meta.json",
                             env=self._env,
                             binary=self._rclone_bin,
                             config_file=self._rclone_config_file,
@@ -1289,10 +1210,11 @@ class SyncEngine:
 
                     try:
                         # Check if cloud save is compressed (v2 format)
-                        sync_meta = cloud_sync_metas.get(game_id)
-                        if sync_meta is not None and sync_meta.compressed:
+                        # Manifest now contains all compression metadata
+                        cloud = cloud_manifests.get(game_id)
+                        if cloud is not None and cloud.compressed:
                             # Download compressed archive
-                            archive_key = f"{prefix}/{sync_meta.archive_name}"
+                            archive_key = f"{prefix}/{cloud.archive_name}"
                             try:
                                 archive_data = rclone.read_file(
                                     self._config.drive_remote,

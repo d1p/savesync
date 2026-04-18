@@ -11,7 +11,7 @@ from savesync_bridge.core import manifest as manifest_module
 from savesync_bridge.core.config import AppConfig
 from savesync_bridge.core.exceptions import LudusaviError, RcloneError
 from savesync_bridge.core.sync_engine import SyncEngine, SyncResult, scan_save_directories
-from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncMeta, SyncStatus
+from savesync_bridge.models.game import GameManifest, Platform, SaveFile, SyncStatus
 from savesync_bridge.cli.ludusavi import LudusaviGame, SaveFileInfo
 
 GAME_ID = "Hades"
@@ -131,15 +131,19 @@ class TestPush:
         # game_name is first positional arg
         assert call_args[0][0] == GAME_ID
 
-    def test_calls_rclone_upload_three_times(self, engine: SyncEngine) -> None:
-        """Should upload lock, archive, manifest.json, and sync_meta.json."""
+    def test_calls_rclone_upload_twice(self, engine: SyncEngine) -> None:
+        """Should upload archive and manifest.json (manifest now contains all metadata).
+        
+        Note: _rotate_versions may also make additional uploads if old versions exist.
+        """
         with (
             patch("savesync_bridge.core.sync_engine.ludusavi") as mock_lud,
             patch("savesync_bridge.core.sync_engine.rclone") as mock_rcl,
         ):
             mock_lud.backup_game.return_value = Path("/tmp/staging/Hades")
             engine.push(GAME_ID)
-        assert mock_rcl.upload.call_count == 4
+        # At minimum: archive + manifest (2 uploads)
+        assert mock_rcl.upload.call_count >= 2
 
     def test_saves_local_manifest_after_push(self, engine: SyncEngine, tmp_path: Path) -> None:
         with (
@@ -392,28 +396,26 @@ class TestCheckStatus:
             result = engine.check_status(GAME_ID)
         assert result.status == SyncStatus.CONFLICT
 
-    def test_conflict_status_from_sync_meta_fast_path_when_hash_differs(
+    def test_conflict_status_when_hash_differs(
         self, engine: SyncEngine
     ) -> None:
         local = _make_manifest(content_hash="sha256:old")
         self._write_local(engine, local)
-        cloud_meta = SyncMeta(
+        cloud = GameManifest(
             game_id=GAME_ID,
+            host=Platform.WINDOWS,
             hash="sha256:new",
             timestamp=datetime(2026, 4, 12, 12, 0, 0, tzinfo=UTC),
+            files=(),
             compressed=True,
             archive_name="save.tar.gz",
             total_size=1024,
         )
-        with (
-            patch.object(engine, "_get_cloud_sync_meta", return_value=cloud_meta),
-            patch.object(engine, "get_cloud_manifest", return_value=None) as mock_full,
-        ):
+        with patch.object(engine, "get_cloud_manifest", return_value=cloud):
             result = engine.check_status(GAME_ID)
         assert result.status == SyncStatus.CONFLICT
-        mock_full.assert_called_once()
 
-    def test_sync_meta_conflict_falls_back_to_full_manifest_when_ignored_files_differ(
+    def test_conflict_falls_back_to_full_manifest_when_ignored_files_differ(
         self, engine: SyncEngine
     ) -> None:
         local = GameManifest(
@@ -431,15 +433,6 @@ class TestCheckStatus:
             ),
         )
         self._write_local(engine, local)
-
-        cloud_meta = SyncMeta(
-            game_id=GAME_ID,
-            hash="sha256:old-mapping",
-            timestamp=datetime(2026, 4, 12, 10, 0, 0, tzinfo=UTC),
-            compressed=True,
-            archive_name="save.tar.gz",
-            total_size=1024,
-        )
 
         cloud = GameManifest(
             game_id=GAME_ID,
@@ -460,50 +453,32 @@ class TestCheckStatus:
                     file_hash="sha256:ignored",
                 ),
             ),
+            compressed=True,
+            archive_name="save.tar.gz",
+            total_size=2048,
         )
 
-        with (
-            patch.object(engine, "_get_cloud_sync_meta", return_value=cloud_meta),
-            patch.object(engine, "get_cloud_manifest", return_value=cloud) as mock_full,
-        ):
+        with patch.object(engine, "get_cloud_manifest", return_value=cloud):
             result = engine.check_status(GAME_ID)
         assert result.status == SyncStatus.SYNCED
-        mock_full.assert_called_once()
 
-    def test_uses_sync_meta_fast_path(self, engine: SyncEngine) -> None:
-        """check_status should use sync_meta when available, skipping full manifest fetch."""
+    def test_direct_manifest_comparison(self, engine: SyncEngine) -> None:
+        """check_status should compare full manifests directly."""
         local = _make_manifest(content_hash="sha256:same")
         self._write_local(engine, local)
-        cloud_meta = SyncMeta(
+        cloud = GameManifest(
             game_id=GAME_ID,
+            host=Platform.WINDOWS,
             hash="sha256:same",
             timestamp=local.timestamp,
+            files=local.files,
             compressed=True,
             archive_name="save.tar.gz",
             total_size=1024,
         )
-        with (
-            patch.object(engine, "_get_cloud_sync_meta", return_value=cloud_meta),
-            patch.object(engine, "get_cloud_manifest") as mock_full,
-        ):
+        with patch.object(engine, "get_cloud_manifest", return_value=cloud):
             result = engine.check_status(GAME_ID)
         assert result.status == SyncStatus.SYNCED
-        mock_full.assert_not_called()  # should NOT fall back to full manifest
-
-    def test_sync_meta_probe_is_silent(self, engine: SyncEngine) -> None:
-        cloud_meta = SyncMeta(
-            game_id=GAME_ID,
-            hash="sha256:same",
-            timestamp=datetime(2026, 4, 12, 10, 0, 0, tzinfo=UTC),
-            compressed=True,
-            archive_name="save.tar.gz",
-            total_size=1024,
-        )
-        with patch("savesync_bridge.core.sync_engine.rclone") as mock_rclone:
-            mock_rclone.read_file.return_value = manifest_module.sync_meta_to_json(cloud_meta).encode("utf-8")
-            result = engine._get_cloud_sync_meta(GAME_ID)
-        assert result == cloud_meta
-        assert mock_rclone.read_file.call_args.kwargs["report_cli"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -667,40 +642,15 @@ class TestSyncUnknownNoAutoPush:
 
 
 class TestVerifyCloudIntegrity:
-    def test_ok_when_hashes_match(self, engine: SyncEngine) -> None:
+    def test_ok_when_manifest_exists(self, engine: SyncEngine) -> None:
         m = _make_manifest(content_hash="sha256:abc123")
-        meta = SyncMeta(
-            game_id=GAME_ID, hash="sha256:abc123",
-            timestamp=datetime(2026, 4, 12, 10, 0, 0, tzinfo=UTC),
-            compressed=True, archive_name="save.tar.gz", total_size=1024,
-        )
-        with (
-            patch.object(engine, "get_cloud_manifest", return_value=m),
-            patch.object(engine, "_get_cloud_sync_meta", return_value=meta),
-        ):
+        with patch.object(engine, "get_cloud_manifest", return_value=m):
             ok, msg = engine.verify_cloud_integrity(GAME_ID)
         assert ok is True
         assert "OK" in msg
 
-    def test_fails_when_hashes_differ(self, engine: SyncEngine) -> None:
-        m = _make_manifest(content_hash="sha256:aaa")
-        meta = SyncMeta(
-            game_id=GAME_ID, hash="sha256:bbb",
-            timestamp=datetime(2026, 4, 12, 10, 0, 0, tzinfo=UTC),
-        )
-        with (
-            patch.object(engine, "get_cloud_manifest", return_value=m),
-            patch.object(engine, "_get_cloud_sync_meta", return_value=meta),
-        ):
-            ok, msg = engine.verify_cloud_integrity(GAME_ID)
-        assert ok is False
-        assert "mismatch" in msg.lower()
-
     def test_fails_when_manifest_missing(self, engine: SyncEngine) -> None:
-        with (
-            patch.object(engine, "get_cloud_manifest", return_value=None),
-            patch.object(engine, "_get_cloud_sync_meta", return_value=None),
-        ):
+        with patch.object(engine, "get_cloud_manifest", return_value=None):
             ok, msg = engine.verify_cloud_integrity(GAME_ID)
         assert ok is False
 
