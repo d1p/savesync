@@ -103,15 +103,19 @@ def from_json(data: str) -> GameManifest:
     )
 
 
-def compare(local: GameManifest, cloud: GameManifest) -> SyncStatus:
+def compare(local: GameManifest, cloud: GameManifest, runner_machine_id: str | None = None) -> SyncStatus:
     """Compare a local and cloud manifest to determine sync status.
 
     Args:
         local: Manifest from the local machine.
         cloud: Manifest from cloud storage.
+        runner_machine_id: The current runner/machine ID. If provided and matches local's
+            machine_id, and local.timestamp > cloud.timestamp, returns LOCAL_NEWER to skip
+            conflict resolution.
 
     Returns:
         - :attr:`~SyncStatus.SYNCED` — hashes match; no action needed.
+        - :attr:`~SyncStatus.LOCAL_NEWER` — local timestamp is newer and originated from same machine.
         - :attr:`~SyncStatus.CONFLICT` — hashes differ, so the saves contain
           different content and require user review.
 
@@ -122,12 +126,27 @@ def compare(local: GameManifest, cloud: GameManifest) -> SyncStatus:
         semantics, differing hashes are treated conservatively as conflicts.
         However, if per-file content hashes are available and all files have
         identical content (only metadata differs), treat as synced.
+        
+        The machine_id check optimizes the common case where the same machine
+        has been actively playing: if the local version originated from the
+        current machine and is newer, we can trust the local version without
+        needing complex conflict resolution.
     """
     local = _manifest_without_ignored_files(local)
     cloud = _manifest_without_ignored_files(cloud)
 
     if local.hash == cloud.hash:
         return SyncStatus.SYNCED
+
+    # Smart machine ID check: if this is the same machine that created the local
+    # save and it's newer than cloud, just push without conflict resolution
+    if (
+        runner_machine_id
+        and local.machine_id
+        and runner_machine_id.lower() == local.machine_id.lower()
+        and local.timestamp > cloud.timestamp
+    ):
+        return SyncStatus.LOCAL_NEWER
 
     diff = diff_manifests(local, cloud)
     if (
@@ -175,10 +194,34 @@ def sync_meta_from_json(data: str) -> SyncMeta:
     )
 
 
-def compare_meta(local: GameManifest, cloud_meta: SyncMeta) -> SyncStatus:
-    """Compare a local manifest with a lightweight cloud SyncMeta."""
+def compare_meta(local: GameManifest, cloud_meta: SyncMeta, runner_machine_id: str | None = None) -> SyncStatus:
+    """Compare a local manifest with a lightweight cloud SyncMeta.
+    
+    Args:
+        local: Local game manifest.
+        cloud_meta: Lightweight cloud metadata.
+        runner_machine_id: The current runner/machine ID. If provided and matches local's
+            machine_id, and local.timestamp > cloud_meta.timestamp, returns LOCAL_NEWER to skip
+            conflict resolution.
+    
+    Returns:
+        - :attr:`~SyncStatus.SYNCED` — hashes match.
+        - :attr:`~SyncStatus.LOCAL_NEWER` — local timestamp is newer and originated from same machine.
+        - :attr:`~SyncStatus.CONFLICT` — hashes differ.
+    """
     if local.hash == cloud_meta.hash:
         return SyncStatus.SYNCED
+    
+    # Smart machine ID check: if this is the same machine that created the local
+    # save and it's newer than cloud, just push without conflict resolution
+    if (
+        runner_machine_id
+        and local.machine_id
+        and runner_machine_id.lower() == local.machine_id.lower()
+        and local.timestamp > cloud_meta.timestamp
+    ):
+        return SyncStatus.LOCAL_NEWER
+    
     return SyncStatus.CONFLICT
 
 

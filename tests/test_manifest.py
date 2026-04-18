@@ -43,6 +43,7 @@ def _manifest(
     timestamp: datetime = _T0,
     hash_: str = "sha256:aabbcc",
     files: tuple[SaveFile, ...] = (),
+    machine_id: str = "",
 ) -> GameManifest:
     return GameManifest(
         game_id=game_id,
@@ -50,6 +51,7 @@ def _manifest(
         timestamp=timestamp,
         hash=hash_,
         files=files,
+        machine_id=machine_id,
     )
 
 
@@ -236,6 +238,7 @@ def _sync_meta(
     compressed: bool = True,
     archive_name: str = "save.tar.gz",
     total_size: int = 4096,
+    machine_id: str = "",
 ) -> SyncMeta:
     return SyncMeta(
         game_id=game_id,
@@ -244,6 +247,7 @@ def _sync_meta(
         compressed=compressed,
         archive_name=archive_name,
         total_size=total_size,
+        machine_id=machine_id,
     )
 
 
@@ -298,6 +302,70 @@ def test_compare_meta_conflict() -> None:
     local = _manifest(timestamp=_T1, hash_="sha256:a")
     cloud = _sync_meta(timestamp=_T1, hash_="sha256:b")
     assert compare_meta(local, cloud) == SyncStatus.CONFLICT
+
+
+def test_compare_meta_smart_machine_id_same_machine_newer_local() -> None:
+    """If local came from same machine and is newer, return LOCAL_NEWER instead of CONFLICT."""
+    local = _manifest(
+        timestamp=_T2,
+        hash_="sha256:local",
+        machine_id="my-machine",
+    )
+    cloud = _sync_meta(timestamp=_T1, hash_="sha256:cloud", machine_id="my-machine")
+    # Without machine_id: would be CONFLICT
+    assert compare_meta(local, cloud) == SyncStatus.CONFLICT
+    # With matching machine_id and local newer: LOCAL_NEWER
+    assert compare_meta(local, cloud, runner_machine_id="my-machine") == SyncStatus.LOCAL_NEWER
+    # Case-insensitive comparison
+    assert compare_meta(local, cloud, runner_machine_id="MY-MACHINE") == SyncStatus.LOCAL_NEWER
+
+
+def test_compare_meta_smart_machine_id_same_machine_older_local() -> None:
+    """If local came from same machine but is older, return CONFLICT (don't trust timestamp alone)."""
+    local = _manifest(
+        timestamp=_T1,
+        hash_="sha256:local",
+        machine_id="my-machine",
+    )
+    cloud = _sync_meta(timestamp=_T2, hash_="sha256:cloud", machine_id="my-machine")
+    # Local is older; still CONFLICT
+    assert compare_meta(local, cloud, runner_machine_id="my-machine") == SyncStatus.CONFLICT
+
+
+def test_compare_meta_smart_machine_id_different_machine() -> None:
+    """If local came from different machine, ignore timestamp and return CONFLICT."""
+    local = _manifest(
+        timestamp=_T2,
+        hash_="sha256:local",
+        machine_id="machine-a",
+    )
+    cloud = _sync_meta(timestamp=_T1, hash_="sha256:cloud", machine_id="machine-b")
+    # Even though local is newer and machine_id is provided, it doesn't match local
+    assert compare_meta(local, cloud, runner_machine_id="machine-b") == SyncStatus.CONFLICT
+
+
+def test_compare_smart_machine_id_same_machine_newer_local() -> None:
+    """Full compare() also respects machine ID: same machine, local newer -> LOCAL_NEWER."""
+    local = _manifest(
+        timestamp=_T2,
+        hash_="sha256:local",
+        machine_id="laptop",
+        files=(
+            SaveFile(path="save.dat", size=100, modified=_T2, file_hash="sha256:abc"),
+        ),
+    )
+    cloud = _manifest(
+        timestamp=_T1,
+        hash_="sha256:cloud",
+        machine_id="laptop",
+        files=(
+            SaveFile(path="save.dat", size=100, modified=_T1, file_hash="sha256:xyz"),
+        ),
+    )
+    # Without machine_id: CONFLICT
+    assert compare(local, cloud) == SyncStatus.CONFLICT
+    # With matching machine_id and local newer: LOCAL_NEWER
+    assert compare(local, cloud, runner_machine_id="laptop") == SyncStatus.LOCAL_NEWER
 
 
 # ---------------------------------------------------------------------------

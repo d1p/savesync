@@ -798,6 +798,10 @@ class SyncEngine:
 
         Tries the lightweight sync_meta.json first for speed, then falls back
         to the full manifest.json for backward compatibility.
+        
+        Uses machine ID and timestamp checks to intelligently resolve local vs cloud
+        conflicts: if the local version originated from the current machine and is
+        newer, immediately returns LOCAL_NEWER without conflict resolution.
         """
         local: GameManifest | None
         if use_live_local:
@@ -809,7 +813,7 @@ class SyncEngine:
         # Fast path: try lightweight sync_meta.json
         cloud_meta = self._get_cloud_sync_meta(game_id)
         if cloud_meta is not None and local is not None:
-            status = manifest_module.compare_meta(local, cloud_meta)
+            status = manifest_module.compare_meta(local, cloud_meta, runner_machine_id=self._config.machine_name)
             if status != SyncStatus.CONFLICT:
                 return SyncResult(game_id=game_id, status=status, local_manifest=local)
 
@@ -819,7 +823,7 @@ class SyncEngine:
             cloud = self.get_cloud_manifest(game_id)
             if cloud is None:
                 return SyncResult(game_id=game_id, status=status, local_manifest=local)
-            status = manifest_module.compare(local, cloud)
+            status = manifest_module.compare(local, cloud, runner_machine_id=self._config.machine_name)
             return SyncResult(
                 game_id=game_id,
                 status=status,
@@ -839,7 +843,7 @@ class SyncEngine:
         if local is None:
             return SyncResult(game_id=game_id, status=SyncStatus.CLOUD_NEWER, cloud_manifest=cloud)
 
-        status = manifest_module.compare(local, cloud)
+        status = manifest_module.compare(local, cloud, runner_machine_id=self._config.machine_name)
         return SyncResult(
             game_id=game_id,
             status=status,
